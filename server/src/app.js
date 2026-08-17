@@ -5,6 +5,7 @@ import { config } from './config.js';
 import { logger } from './utils/logger.js';
 import { pool } from './db/pool.js';
 import { errorHandler } from './middleware/errorHandler.js';
+import authRoutes from './routes/auth.routes.js';
 
 // Builds and configures the Express application (kept separate from index.js
 // so tests can import the app without starting the HTTP listener).
@@ -14,6 +15,8 @@ export function createApp() {
   app.use(cors({ origin: config.corsOrigin }));
   app.use(express.json());
   app.use(pinoHttp({ logger }));
+
+  app.use('/api/auth', authRoutes);
 
   app.get('/healthz', async (req, res) => {
     try {

@@ -75,5 +75,35 @@ safeguard against accidentally wiping dev data.
   the process if the DB is unreachable: `200 { status: 'ok', db: 'ok' }` when healthy, or
   `503 { status: 'ok', db: 'error' }` when the DB can't be reached.
 
+## Authentication
+
+```
+POST /api/auth/register   { email, password, displayName } -> 201 { user, accessToken, refreshToken }
+POST /api/auth/login      { email, password }               -> 200 { user, accessToken, refreshToken }
+POST /api/auth/refresh    { refreshToken }                  -> 200 { accessToken, refreshToken }
+```
+
+- Access tokens are short-lived JWTs (15 min); refresh tokens are opaque random values, stored
+  hashed in the database, and **rotate on every use** — refreshing invalidates the token you just
+  presented, so a stolen-then-reused refresh token is always rejected.
+- Login returns the same generic error for a wrong password and a nonexistent email (both message
+  and response timing), so a failed login never reveals whether an account exists.
+
+Example:
+
+```bash
+curl -X POST http://localhost:4000/api/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"email":"maya@example.com","password":"correct horse battery staple","displayName":"Maya"}'
+```
+
+## Docker build gotcha (fixed, kept here as a note)
+
+Both `server/` and `client/` need a `.dockerignore` excluding `node_modules` — without it,
+`COPY . .` in the Dockerfile copies your host's own `node_modules` into the image on top of the
+one `npm install` just built there. This is invisible for pure-JS dependencies but corrupts
+native modules (e.g. `bcrypt`) with a platform mismatch. If you ever see `invalid ELF header` or
+`Exec format error` from a native module inside a container, this is almost certainly why.
+
 This README is built out progressively as each phase lands, with a full polish pass in the final
 phase.
