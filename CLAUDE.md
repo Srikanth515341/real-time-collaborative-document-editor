@@ -67,6 +67,16 @@ server/
       requireRole.js  — factory: requireRole('editor') etc.; calls documentService's
                         ensureUserCanAccess against req.params.id, 403 via errorHandler on
                         denial
+    websocket/
+      roomManager.js    — in-memory Room registry (documentId -> {yDoc, clients}); Phase 6
+                          is in-memory only, no DB calls — Phase 11 adds real persistence
+      wsServer.js        — attaches `ws` to the same HTTP server as Express (one port)
+      messageRouter.js   — message `type` -> handler dispatch, UNKNOWN_MESSAGE_TYPE on a miss
+      handlers/
+        joinDocument.js  — INTENTIONALLY has no JWT/permission check yet (see the comment
+                          block at the top of the file) — Phase 7 adds it
+        syncUpdate.js    — Y.applyUpdate + broadcast to the room; malformed updates are
+                          logged and dropped, never crash the room
     utils/
       logger.js       — pino structured logger (no console.log anywhere in the codebase)
       jwt.js          — sign(payload)/verify(token) helpers, access-token secret by default
@@ -76,8 +86,13 @@ server/
     app.js          — Express app construction (no listener — testable); CORS locked to
                       config.corsOrigin, auth + documents routes mounted, errorHandler
                       mounted last, GET /healthz checks the DB
-    index.js        — entrypoint; starts the HTTP listener, has process-level
+    index.js        — entrypoint; creates an http.Server explicitly (so the WebSocket
+                      server from Phase 6 can attach to the same port), has process-level
                       unhandledRejection/uncaughtException logging
+  scripts/
+    makeYjsUpdate.js, decodeYjsState.js — manual-testing-only CLI helpers (not part of the
+      server) for generating/decoding base64 Yjs updates to use with wscat, since wscat
+      can't hand-type valid binary CRDT payloads
   tests/
     env.setup.js    — preloaded via `node --import`; points DATABASE_URL (and now
                       CORS_ORIGIN/JWT secrets, since config.js requires them) at server/.env.test
@@ -89,6 +104,10 @@ server/
     integration/documentsApi.test.js — full documents+permissions API lifecycle against a
                                         real ephemeral server + test DB (create/list/rename/
                                         delete, cascade, grant/revoke, every 403 negative case)
+    unit/crdtMerge.test.js — proves Yjs's convergence guarantee in isolation (no WebSocket,
+                              no DB): identical final state regardless of update order,
+                              across 2-way/3-way(all 6 permutations)/idempotency/randomized-
+                              shuffle scenarios. The single most important test in the project.
     db/             — repo-layer tests, one file per repo module, run against a real
                       disposable Postgres database (server/tests/db/helpers.js has the
                       shared TRUNCATE/fixture helpers)
@@ -289,7 +308,7 @@ docker-compose.yml
   corruption (found via direct query); repaired with a single targeted `UPDATE` scoped to that
   exact `document_id`+`user_id`, verified no other rows were affected.
 
-**Phase 5 — Frontend Foundation: ✅ Done**
+**Phase 5 — Frontend Foundation: ✅ Done (merged to main)**
 
 - **Token storage decision** (explicitly asked for, not a default): the backend returns tokens
   in the JSON response body, not httpOnly cookies, so the strongest option (cookies JS literally
@@ -332,7 +351,39 @@ docker-compose.yml
   repeat unauthenticated redirect, and a page-reload session-restore check. Zero console errors,
   zero failed/5xx requests, across two full runs after the StrictMode fix.
 
-**Next: Phase 6 — CRDT Sync Engine — Isolated Proof of Concept**
+**Phase 6 — CRDT Sync Engine — Isolated Proof of Concept: ✅ Done**
 
-Branch in progress: `phase-5-frontend-foundation` (not yet merged — pending user verification
-and commit).
+- Added `yjs`. Built the WebSocket layer entirely in-memory, deliberately isolated from the rest
+  of the product per this phase's explicit scope: no DB persistence (Phase 11), no auth on the
+  socket (Phase 7 — see the large comment block at the top of `handlers/joinDocument.js`), no
+  presence/awareness (Phase 10), no frontend wiring (Phase 8).
+- `tests/unit/crdtMerge.test.js` — written first, before any WebSocket code, per the phase's own
+  instruction. Four tests, deliberately more rigorous than "just one ordering": two-way
+  concurrent edits merged in both orders; three-way concurrent edits merged under **all 6**
+  possible permutations (asserts the *set* of distinct outcomes has size 1, not just one
+  before/after comparison); duplicate-delivery idempotency; and 5 clients x 4 random-position
+  edits each, merged under 8 independent random shuffles, all converging to the same result.
+- `roomManager.js` matches TECHNICAL_DESIGN.md Section 4's sketch (`Room` class,
+  `getOrCreateRoom`/`addClientToRoom`/`removeClientFromRoom`) plus `broadcastToRoom` — not
+  explicitly named in this phase's own bullet list, but `syncUpdate.js`'s pseudocode calls it
+  directly, so it's necessary supporting code, not scope creep.
+- `index.js` now creates an explicit `http.Server` (`http.createServer(app)`) instead of calling
+  `app.listen()` directly, so `wsServer.js` can attach a `ws` WebSocketServer to the same port
+  via the `{ server }` option — `app.js` itself is unchanged, so every existing test (which
+  imports `createApp()` directly) is unaffected.
+- Manual verification tooling: `scripts/makeYjsUpdate.js` / `scripts/decodeYjsState.js` —
+  `wscat` can't hand-type a valid binary Yjs update, so these generate/decode one to paste in.
+  Documented in README with a full two-terminal `wscat` walkthrough.
+- 74 tests total (4 new). Also verified live against the running Docker server with a scripted
+  two/three-session WebSocket client (not just curl) covering: join → sync-step, broadcast in
+  both directions, a late-joining third client correctly seeing the room's already-merged state
+  (not just future updates), an unknown message type returning a clean error, and a malformed
+  update being dropped with an `INVALID_UPDATE` error while the server stays healthy afterward
+  (confirmed via `/healthz` immediately after). 13/13 live checks passed.
+- Hit the same stale-anonymous-`node_modules`-volume Docker issue as Phase 3 (bcrypt) and Phase 5
+  (react-router-dom) — this time with `yjs`. Documented it properly in the README this time
+  (`--force-recreate --renew-anon-volumes`) instead of just fixing it silently again.
+
+**Next: Phase 7 — WebSocket Gateway — Production Integration**
+
+Branch in progress: `phase-6-crdt-poc` (not yet merged — pending user verification and commit).

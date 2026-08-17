@@ -140,6 +140,67 @@ owner — an access panel to grant/revoke `editor`/`viewer` roles by email.
 lingering credential. This is a deliberate tradeoff, not a default — see `CLAUDE.md`'s Phase 5
 notes for the full reasoning and what a stronger (httpOnly-cookie) version would need.
 
+## CRDT sync engine (WebSocket) — manual verification
+
+The WebSocket gateway (`ws://localhost:4000`) lets clients join a document "room" and broadcast
+Yjs CRDT updates to everyone else in it. **As of Phase 6 this has no auth or permission checks —
+that's intentional, see the comment at the top of `server/src/websocket/handlers/joinDocument.js`.
+Phase 7 adds real JWT verification here.**
+
+`wscat` can't hand-type a valid binary Yjs update, so two tiny helper scripts (manual-testing
+only, not part of the server) generate/decode them:
+
+```bash
+cd server
+node scripts/makeYjsUpdate.js "Hello world"      # prints a base64 update to paste into wscat
+node scripts/decodeYjsState.js "<base64>"        # decodes one back to readable text
+```
+
+**Two-session walkthrough** (open two terminals):
+
+Terminal 1:
+```bash
+wscat -c ws://localhost:4000
+> {"type":"join-document","documentId":"demo-doc","userId":"alice"}
+# <- {"type":"sync-step","documentId":"demo-doc","update":"..."}  (room's current state)
+```
+
+Terminal 2:
+```bash
+wscat -c ws://localhost:4000
+> {"type":"join-document","documentId":"demo-doc","userId":"bob"}
+# <- sync-step, same as above
+```
+
+Generate an update and send it from Terminal 1 (paste the base64 from `makeYjsUpdate.js` in
+place of `<PASTE_UPDATE_HERE>`):
+```bash
+node scripts/makeYjsUpdate.js "Hello from Alice"
+```
+```
+> {"type":"sync-update","documentId":"demo-doc","update":"<PASTE_UPDATE_HERE>"}
+```
+
+Terminal 2 should immediately receive a broadcast:
+```
+# <- {"type":"sync-update","documentId":"demo-doc","update":"<same base64>","fromUserId":"alice"}
+```
+
+Decode it to confirm the content:
+```bash
+node scripts/decodeYjsState.js "<the base64 from the broadcast>"
+# -> Hello from Alice
+```
+
+Open a third `wscat` session and `join-document` the same `demo-doc` — its `sync-step` will
+contain the room's current merged state (decode it the same way) even though it never saw the
+earlier updates happen live, which is the whole point: the CRDT guarantees convergence regardless
+of when a client joined.
+
+Sending `{"type":"not-a-real-type"}` should get back a clear `UNKNOWN_MESSAGE_TYPE` error, and
+sending a `sync-update` with garbage (non-base64/non-Yjs) `update` content should get back
+`INVALID_UPDATE` without crashing the room or the server.
+
 ## Docker build gotcha (fixed, kept here as a note)
 
 Both `server/` and `client/` need a `.dockerignore` excluding `node_modules` — without it,
@@ -147,6 +208,16 @@ Both `server/` and `client/` need a `.dockerignore` excluding `node_modules` —
 one `npm install` just built there. This is invisible for pure-JS dependencies but corrupts
 native modules (e.g. `bcrypt`) with a platform mismatch. If you ever see `invalid ELF header` or
 `Exec format error` from a native module inside a container, this is almost certainly why.
+
+**After adding a new dependency**, a plain `docker compose up -d --build <service>` can still run
+the *old* `node_modules` — Docker Compose reuses the anonymous volume backing `/app/node_modules`
+across recreations, so the newly-built image's `node_modules` never actually gets mounted. If a
+container fails with `Cannot find package 'x'` right after you added `x` to `package.json`, rerun
+with `--force-recreate --renew-anon-volumes` on that service:
+
+```bash
+docker compose up -d --build --force-recreate --renew-anon-volumes server
+```
 
 This README is built out progressively as each phase lands, with a full polish pass in the final
 phase.
