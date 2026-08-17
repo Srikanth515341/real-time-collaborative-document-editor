@@ -38,6 +38,19 @@ router.post('/', requireRole('owner'), async (req, res, next) => {
       throw new NotFoundError('No user with that email was found.');
     }
 
+    // grantPermission upserts on (document_id, user_id), so granting
+    // editor/viewer to a user who already holds 'owner' on this document
+    // would silently overwrite (downgrade) their owner permission. Blocked
+    // here for the same reason 'owner' isn't grantable and the owner's
+    // access isn't revocable below: exactly one owner per document.
+    const existingRole = await permissionsRepo.getUserRole({
+      documentId: req.params.id,
+      userId: user.id,
+    });
+    if (existingRole === 'owner') {
+      throw new ValidationError("The document owner's role cannot be changed through this endpoint.");
+    }
+
     const grant = await permissionsRepo.grantPermission({
       documentId: req.params.id,
       userId: user.id,

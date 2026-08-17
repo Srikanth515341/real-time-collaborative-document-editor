@@ -15,8 +15,8 @@ Full requirements: [PRD.md](PRD.md). Full architecture/schema/API/protocol desig
 
 ## Tech Stack
 
-- **Frontend**: React (Vite), Yjs (CRDT client), rich-text editing surface (ProseMirker/Yjs
-  binding, added in later phases)
+- **Frontend**: React (Vite), react-router-dom, Yjs (CRDT client, later phases), rich-text
+  editing surface (ProseMirror/Yjs binding, added in later phases)
 - **Backend**: Node.js, Express, `ws` for the WebSocket gateway
 - **Database**: PostgreSQL (`pg`, parameterized SQL, no ORM)
 - **Auth**: JWT access + refresh tokens, per-document ACLs
@@ -99,7 +99,23 @@ server/
                       native modules with the host's, breaking bcrypt in Docker)
 client/
   src/
-    App.jsx, main.jsx, etc.
+    api/
+      httpClient.js   — fetch wrapper; owns token storage (see Current Status for the
+                        token-storage decision) and the 401 -> silent-refresh-> retry flow
+      authApi.js       — register/login/refresh, wraps httpClient.request (not
+                        authenticatedRequest -- a 401 here is a real login error, not an
+                        expired-session signal)
+      documentsApi.js  — one function per Phase 4 backend endpoint, via
+                        httpClient.authenticatedRequest
+    hooks/
+      useAuth.js       — AuthProvider + useAuth(); kept as plain .js (uses createElement,
+                        not JSX syntax, since Vite only JSX-transforms .jsx by default)
+    components/
+      ProtectedRoute.jsx  — redirects to /login if not authenticated
+      PermissionsPanel.jsx — owner-only; list/grant/revoke access
+    pages/
+      LoginPage.jsx, RegisterPage.jsx, DashboardPage.jsx, DocumentEditorPage.jsx
+    App.jsx  — react-router-dom routes; main.jsx is the entrypoint (unchanged since Phase 0)
 PRD.md
 TECHNICAL_DESIGN.md   — partially populated (Section 4 "Backend Module Design" only so far)
 ROADMAP.md
@@ -229,7 +245,8 @@ docker-compose.yml
   for pure-JS deps but corrupting `bcrypt`'s native binary (`invalid ELF header`) once this phase
   introduced it. Added `.dockerignore` to both `server/` and `client/` (client had the same
   latent bug, just never surfaced since it has no native deps).
-**Phase 4 — Document & Permissions REST API: ✅ Done**
+
+**Phase 4 — Document & Permissions REST API: ✅ Done (merged to main)**
 
 - `documentService.createNewDocument()` — creates the document row and grants the creator
   'owner' permission in a single atomic DB transaction (new `db/withTransaction.js` helper;
@@ -259,8 +276,63 @@ docker-compose.yml
 - Verified live against Docker end-to-end (curl walkthrough matching every test scenario,
   including checking `document_permissions` row counts in psql before/after delete to confirm
   the cascade).
+- **Post-merge bugfix (found during Phase 5 manual testing, fixed on the Phase 5 branch)**:
+  `POST /:id/permissions` had two owner-protecting guards (block granting `role: 'owner'`, block
+  revoking the owner) but missed a third variant of the same invariant — nothing stopped
+  granting `editor`/`viewer` to a user who *already* held `owner` on that document.
+  `grantPermission`'s upsert (`ON CONFLICT ... DO UPDATE SET role = EXCLUDED.role`) would
+  silently overwrite their owner row. Real-world trigger: granting access to your own email while
+  testing the UI's grant form silently downgrades your own ownership. Fixed by checking the
+  target's current role before granting and rejecting with 400 if it's `owner`. Added a
+  regression test (`granting editor/viewer to the current owner's own email is rejected and does
+  not downgrade their role`) — 70 tests total. One pre-existing dev-DB document had this exact
+  corruption (found via direct query); repaired with a single targeted `UPDATE` scoped to that
+  exact `document_id`+`user_id`, verified no other rows were affected.
 
-**Next: Phase 5 — Frontend Foundation**
+**Phase 5 — Frontend Foundation: ✅ Done**
 
-Branch in progress: `phase-4-documents-api` (not yet merged — pending user verification and
-commit).
+- **Token storage decision** (explicitly asked for, not a default): the backend returns tokens
+  in the JSON response body, not httpOnly cookies, so the strongest option (cookies JS literally
+  can't read) isn't available without backend changes outside this phase's scope.
+  - **Access token: in-memory only** (module-scoped variable in `httpClient.js`), never written
+    to any Web Storage — it's the higher-value credential (used on every request), short-lived
+    (15 min) by design, and leaves no persistent artifact for an XSS payload or anyone with
+    devtools/disk access to read later.
+  - **Refresh token + a small cached user profile: `sessionStorage`**, not `localStorage` — the
+    app needs to survive a reload without forcing re-login, so *something* must persist; scoping
+    it to the tab (cleared on close, never synced across tabs/browser restarts) bounds the
+    exposure window versus `localStorage`'s indefinite lifetime. It's still readable by any
+    script running on the page while the tab is open — that's inherent to Web Storage, not a
+    sessionStorage-specific gap. The real fix is an httpOnly refresh-token cookie, which is a
+    legitimate candidate for Phase 13 (Security Hardening) rather than a silent addition here.
+- `httpClient.js` separates `request()` (plain, no auto-refresh — used by `authApi.js`, where a
+  401 is a real "wrong credentials" error to show the user) from `authenticatedRequest()`
+  (attaches the token, retries once after a silent refresh on 401, and notifies the app to clear
+  auth state — causing `ProtectedRoute` to redirect to `/login` — if that refresh also fails).
+- Added `authApi.js` and a `RegisterPage` beyond the phase's literal file list — both necessary
+  to actually exercise register/login through the UI, which the phase's own verification
+  checklist requires.
+- **Found and fixed a real bug via manual browser testing** (Playwright, not just lint/build):
+  React 18 StrictMode double-invokes effects in dev, and the session-restore effect in
+  `useAuth.js` wasn't idempotent against that — it called `/api/auth/refresh` twice on mount,
+  and since refresh tokens are single-use (rotate on redemption, per Phase 3), the second call
+  presented a token the first had already consumed, failed, and incorrectly cleared a session
+  that had actually restored fine. Confirmed in server logs (one refresh succeeded, one got
+  "Invalid or expired refresh token"). Fixed with a `useRef` guard so the restore logic only
+  ever actually runs once per mount, regardless of how many times StrictMode invokes the effect.
+- Two known rough edges, deliberately left as-is rather than silently touching already-merged
+  Phase 4 backend code: `PermissionsPanel` displays each grant's raw `userId` (a UUID) instead
+  of an email/display name, because `listPermissionsForDocument` doesn't join to `users`; and
+  the dashboard doesn't show each document's `role` per PRD FR-12, because `GET /api/documents`
+  doesn't return one per document. Both are small, targeted backend query changes if you want
+  them — flagging rather than assuming.
+- Verified end-to-end in a real headless browser (Playwright, installed standalone in the
+  scratchpad — not added as a project dependency): unauthenticated redirect, register, create
+  document, open it, register a second account, grant it editor access, log out, redirect,
+  repeat unauthenticated redirect, and a page-reload session-restore check. Zero console errors,
+  zero failed/5xx requests, across two full runs after the StrictMode fix.
+
+**Next: Phase 6 — CRDT Sync Engine — Isolated Proof of Concept**
+
+Branch in progress: `phase-5-frontend-foundation` (not yet merged — pending user verification
+and commit).
