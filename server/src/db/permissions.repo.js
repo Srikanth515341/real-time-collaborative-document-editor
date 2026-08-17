@@ -14,9 +14,12 @@ function mapRow(row) {
 
 // Grants (or updates) a user's role on a document. Upserts on the
 // (document_id, user_id) unique constraint so re-granting changes the role
-// instead of erroring. Returns the resulting permission row.
-export async function grantPermission({ documentId, userId, role }) {
-  const { rows } = await pool.query(
+// instead of erroring. Returns the resulting permission row. Accepts an
+// optional trailing `client` (defaulting to the shared pool) so
+// documentService.createNewDocument can run this inside the same transaction
+// as the document creation.
+export async function grantPermission({ documentId, userId, role }, client = pool) {
+  const { rows } = await client.query(
     `INSERT INTO document_permissions (document_id, user_id, role)
      VALUES ($1, $2, $3)
      ON CONFLICT (document_id, user_id)

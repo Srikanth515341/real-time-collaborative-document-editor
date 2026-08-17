@@ -97,6 +97,36 @@ curl -X POST http://localhost:4000/api/auth/register \
   -d '{"email":"maya@example.com","password":"correct horse battery staple","displayName":"Maya"}'
 ```
 
+## Documents & permissions API
+
+```
+GET    /api/documents                          list documents you own or have access to
+POST   /api/documents                          create a document (you become its owner)
+GET    /api/documents/:id                      metadata + latest snapshot (viewer+)
+PATCH  /api/documents/:id                      rename / archive (editor+)
+DELETE /api/documents/:id                      delete, cascades to permissions/snapshots (owner)
+GET    /api/documents/:id/versions             list snapshots (viewer+)
+GET    /api/documents/:id/permissions          list access grants (owner)
+POST   /api/documents/:id/permissions          grant access, { email, role } (owner)
+DELETE /api/documents/:id/permissions/:userId  revoke access (owner)
+```
+
+All routes require `Authorization: Bearer <accessToken>`. Every write is enforced server-side
+regardless of what a client UI shows — a viewer's token gets 403 on every write path, not just a
+hidden button. Granting `role: "owner"` and revoking the document owner's own access are both
+rejected (400) to preserve exactly one owner per document.
+
+```bash
+TOKEN=$(curl -s -X POST http://localhost:4000/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"maya@example.com","password":"correct horse battery staple"}' \
+  | grep -o '"accessToken":"[^"]*"' | cut -d'"' -f4)
+
+curl -X POST http://localhost:4000/api/documents \
+  -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN" \
+  -d '{"title":"Q3 Roadmap"}'
+```
+
 ## Docker build gotcha (fixed, kept here as a note)
 
 Both `server/` and `client/` need a `.dockerignore` excluding `node_modules` — without it,
