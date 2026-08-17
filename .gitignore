@@ -5,7 +5,9 @@ client/node_modules/
 
 # Environment
 .env
-.env.local
+.env.*
+!.env.example
+!.env.test.example
 *.local
 
 # Build output

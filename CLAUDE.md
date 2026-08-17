@@ -28,19 +28,35 @@ Full requirements: [PRD.md](PRD.md). Full architecture/schema/API/protocol desig
 
 ```
 server/
+  migrations/
+    001_init.sql    — full schema (users, documents, document_permissions,
+                       document_snapshots, operation_log, refresh_tokens)
   src/
-    routes/       — Express route handlers (thin, delegate to services)
-    services/      — business logic
+    routes/       — Express route handlers (thin, delegate to services) [empty, Phase 4+]
+    services/      — business logic [empty, Phase 6+]
     db/            — query functions (parameterized SQL via pg)
-    middleware/     — JWT verification, error handling
-    websocket/      — connection handling, room management, broadcast logic
+      pool.js              — shared pg.Pool
+      applyMigrations.js   — shared migration-runner logic
+      migrate.js           — dev migration runner (npm run migrate)
+      resetTestDb.js       — destructive test-DB reset (npm run test:reset-db)
+      *.repo.js            — one per table/domain: users, documents, permissions,
+                              snapshots, operationLog
+    middleware/     — JWT verification, error handling [empty, Phase 3+]
+    websocket/      — connection handling, room management, broadcast logic [empty, Phase 7+]
     app.js          — Express app construction (no listener — testable)
     index.js        — entrypoint, starts the HTTP listener
+  tests/
+    env.setup.js    — preloaded via `node --import`; points DATABASE_URL at server/.env.test
+    db/             — repo-layer tests, one file per repo module, run against a real
+                      disposable Postgres database (server/tests/db/helpers.js has the
+                      shared TRUNCATE/fixture helpers)
+  .env              — host-side env (gitignored; DATABASE_URL uses `localhost`, not `postgres`)
+  .env.test         — test-DB env (gitignored; see .env.test.example)
 client/
   src/
     App.jsx, main.jsx, etc.
 PRD.md
-TECHNICAL_DESIGN.md
+TECHNICAL_DESIGN.md   — partially populated (Section 4 "Backend Module Design" only so far)
 ROADMAP.md
 docker-compose.yml
 .env.example
@@ -70,19 +86,43 @@ docker-compose.yml
 
 ## Current Status
 
-**Phase 0 — Repository, Environment & Tooling Foundation: ✅ Done**
+**Phase 0 — Repository, Environment & Tooling Foundation: ✅ Done (merged to main)**
 
 - Monorepo scaffolded: `server/` (Express, health check at `GET /healthz`) and `client/`
   (Vite + React, placeholder page).
 - `docker-compose.yml` wired for postgres + server + client; `.env.example` and `.gitignore` in
   place.
 - ESLint + Prettier configured and passing in both `server/` and `client/`.
-- GitHub Actions CI (`.github/workflows/ci.yml`) runs lint for both packages on every push/PR
-  (test job intentionally deferred to Phase 1+, once tests exist).
-- `PRD.md` and `TECHNICAL_DESIGN.md` added as placeholders (paste full content in); `ROADMAP.md`
-  populated with the roadmap content supplied so far.
-- README.md stub in place.
+- GitHub Actions CI (`.github/workflows/ci.yml`) runs lint for both packages on every push/PR.
 
-**Next: Phase 1 — Database Schema, Migrations & Data Access Layer**
+**Phase 1 — Database Schema, Migrations & Data Access Layer: ✅ Done**
 
-Branch in progress: `phase-0-repo-setup` (not yet merged — pending user verification and commit).
+- `server/migrations/001_init.sql` — full schema exactly matching PRD.md Section 10.4 (6 tables,
+  the `document_permissions.role` CHECK constraint, both indexes). Verified against a live
+  Postgres via `\dt` / `\d`.
+- Migration runner (`npm run migrate`) and a separate, safety-guarded test-DB reset script
+  (`npm run test:reset-db` — refuses to run against any database whose name doesn't contain
+  `test`), sharing one `applyMigrations()` implementation.
+- Repo layer: `documents.repo.js`, `permissions.repo.js`, `snapshots.repo.js`,
+  `operationLog.repo.js` implemented to the exact signatures from TECHNICAL_DESIGN.md Section 4;
+  `users.repo.js` added by judgment call (create/findByEmail/findById — password hashing is left
+  to a later auth-service phase, this layer just stores/retrieves whatever hash it's given).
+  Every query is parameterized.
+- 25 passing tests in `server/tests/db/`, run against a real disposable Postgres database (not
+  mocked), including a test that confirms the `role` CHECK constraint rejects an invalid value.
+  Test files must run serially (`--test-concurrency=1`) — Node's test runner spawns one process
+  per file by default, and since all files share one test database, parallel files were
+  truncating each other's fixtures mid-test; forcing serial execution fixed it.
+- Discovered and resolved a local environment issue (not project-specific): a native Windows
+  PostgreSQL 17 service was also bound to port 5432, colliding with Docker's Postgres container.
+  Resolved by stopping/disabling the native service — this project only ever uses the Docker
+  Postgres container.
+- `applyMigrations()` tracks applied filenames in a `schema_migrations` table so `npm run migrate`
+  is safe to re-run (skips already-applied files instead of erroring on "relation already
+  exists") — found this gap when re-running the migrate command a second time against the dev DB.
+- `TECHNICAL_DESIGN.md` still only has Section 4 pasted in — the rest (Sections 1–3, 5–10) will
+  be added as later phases need them.
+
+**Next: Phase 2 — Backend Application Skeleton**
+
+Branch in progress: `phase-1-db-schema` (not yet merged — pending user verification and commit).
