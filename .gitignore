@@ -1,0 +1,32 @@
+# Dependencies
+node_modules/
+server/node_modules/
+client/node_modules/
+
+# Environment
+.env
+.env.local
+*.local
+
+# Build output
+dist/
+build/
+client/dist/
+server/dist/
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/extensions.json
+.idea/
+
+# Docker
+postgres-data/
