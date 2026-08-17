@@ -46,7 +46,11 @@ router.get('/:id', requireRole('viewer'), async (req, res, next) => {
     if (!document) {
       throw new NotFoundError('Document not found.');
     }
-    const latestSnapshot = await documentService.loadDocumentState(req.params.id);
+    // Note: documentService.loadDocumentState() now returns a hydrated Y.Doc
+    // (as of Phase 7 — it's used by the WebSocket room manager), not a
+    // JSON-serializable row, so this REST endpoint goes straight to the repo
+    // for the raw snapshot metadata it actually needs to display.
+    const latestSnapshot = await snapshotsRepo.getLatestSnapshot(req.params.id);
     res.status(200).json({ ...document, latestSnapshot });
   } catch (err) {
     next(err);

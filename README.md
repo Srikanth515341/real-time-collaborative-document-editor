@@ -143,9 +143,18 @@ notes for the full reasoning and what a stronger (httpOnly-cookie) version would
 ## CRDT sync engine (WebSocket) — manual verification
 
 The WebSocket gateway (`ws://localhost:4000`) lets clients join a document "room" and broadcast
-Yjs CRDT updates to everyone else in it. **As of Phase 6 this has no auth or permission checks —
-that's intentional, see the comment at the top of `server/src/websocket/handlers/joinDocument.js`.
-Phase 7 adds real JWT verification here.**
+Yjs CRDT updates to everyone else in it. **As of Phase 7, every write path here is held to the
+same standard as the REST API**: `join-document` requires a real, valid access token and at
+least `viewer` access (checked via `documentService.ensureUserCanAccess`, the same function the
+REST routes use), and `sync-update` requires at least `editor` access. A denied request always
+gets a clear error response first — `join-document` failures also close the socket afterward
+(custom codes: `4001` invalid/expired token, `4003` permission denied).
+
+Because this now requires a real JWT and a real permission grant, you need real accounts and a
+real document first — via the REST API (see the "Documents & permissions API" section above), or
+just register two users and create/share a document through the running frontend at
+`http://localhost:5173`. Grab each user's `accessToken` from the register/login response (or
+re-derive it via `POST /api/auth/login`) and a `documentId` from `POST /api/documents`.
 
 `wscat` can't hand-type a valid binary Yjs update, so two tiny helper scripts (manual-testing
 only, not part of the server) generate/decode them:
@@ -156,46 +165,65 @@ node scripts/makeYjsUpdate.js "Hello world"      # prints a base64 update to pas
 node scripts/decodeYjsState.js "<base64>"        # decodes one back to readable text
 ```
 
-**Two-session walkthrough** (open two terminals):
+**Two-session walkthrough** (open two terminals; substitute a real `documentId` and each user's
+real `accessToken`):
 
-Terminal 1:
+Terminal 1 (the document's owner or an editor):
 ```bash
 wscat -c ws://localhost:4000
-> {"type":"join-document","documentId":"demo-doc","userId":"alice"}
-# <- {"type":"sync-step","documentId":"demo-doc","update":"..."}  (room's current state)
+> {"type":"join-document","documentId":"<DOC_ID>","token":"<OWNER_OR_EDITOR_ACCESS_TOKEN>"}
+# <- {"type":"sync-step","documentId":"<DOC_ID>","update":"..."}  (room's current state)
 ```
 
-Terminal 2:
+Terminal 2 (a second user who's been granted at least `viewer`):
 ```bash
 wscat -c ws://localhost:4000
-> {"type":"join-document","documentId":"demo-doc","userId":"bob"}
+> {"type":"join-document","documentId":"<DOC_ID>","token":"<SECOND_USER_ACCESS_TOKEN>"}
 # <- sync-step, same as above
 ```
 
 Generate an update and send it from Terminal 1 (paste the base64 from `makeYjsUpdate.js` in
 place of `<PASTE_UPDATE_HERE>`):
 ```bash
-node scripts/makeYjsUpdate.js "Hello from Alice"
+node scripts/makeYjsUpdate.js "Hello from an editor"
 ```
 ```
-> {"type":"sync-update","documentId":"demo-doc","update":"<PASTE_UPDATE_HERE>"}
-```
-
-Terminal 2 should immediately receive a broadcast:
-```
-# <- {"type":"sync-update","documentId":"demo-doc","update":"<same base64>","fromUserId":"alice"}
+> {"type":"sync-update","documentId":"<DOC_ID>","update":"<PASTE_UPDATE_HERE>"}
 ```
 
-Decode it to confirm the content:
+If Terminal 1's user has only `editor`/`owner` access, Terminal 2 (if it has at least `viewer`)
+should immediately receive a broadcast:
+```
+# <- {"type":"sync-update","documentId":"<DOC_ID>","update":"<same base64>","fromUserId":"<their userId>"}
+```
+
+**Permission checks to verify explicitly:**
+- If Terminal 2's user only has `viewer` access and tries to send a `sync-update`, expect back
+  `{"type":"error","code":"PERMISSION_DENIED", ...}` and confirm Terminal 1 never receives a
+  broadcast for it.
+- Connect with a garbage token (`"token":"not-a-real-jwt"`) — expect
+  `{"type":"error","code":"UNAUTHORIZED", ...}` and the connection to close immediately after.
+- Connect with a valid token for a user who has no permission grant on that document at all —
+  expect `PERMISSION_DENIED` at `join-document` (not a REST-style 404 — see the note on this in
+  `CLAUDE.md`'s Phase 4 notes; the same "don't leak whether a resource exists" stance carries
+  over to the WebSocket layer).
+
+Decode a broadcast to confirm the content:
 ```bash
 node scripts/decodeYjsState.js "<the base64 from the broadcast>"
-# -> Hello from Alice
 ```
 
-Open a third `wscat` session and `join-document` the same `demo-doc` — its `sync-step` will
-contain the room's current merged state (decode it the same way) even though it never saw the
-earlier updates happen live, which is the whole point: the CRDT guarantees convergence regardless
-of when a client joined.
+Open a third `wscat` session and `join-document` the same document (with a valid token/grant) —
+its `sync-step` will contain the room's current merged state even though it never saw the
+earlier updates happen live.
+
+**Server-restart check**: with a room open and some edits sent, restart the server
+(`docker compose restart server`) and reconnect + `join-document` the same document again. This
+should succeed cleanly with an *empty* room (no crash) — snapshot/operation-log persistence
+doesn't exist until Phase 11, so in-memory-only content is expected to be lost across a restart
+today; the point of this check is only that the server never crashes or hangs on reload, which
+`documentService.loadDocumentState()` (snapshot + operation-log replay, currently usually
+finding neither) makes safe by construction.
 
 Sending `{"type":"not-a-real-type"}` should get back a clear `UNKNOWN_MESSAGE_TYPE` error, and
 sending a `sync-update` with garbage (non-base64/non-Yjs) `update` content should get back

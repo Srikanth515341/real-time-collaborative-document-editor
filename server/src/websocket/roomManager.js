@@ -1,13 +1,20 @@
-import * as Y from 'yjs';
 import { logger } from '../utils/logger.js';
+import * as documentService from '../services/documentService.js';
 
-// In-memory room registry: documentId -> Room. Phase 6 is deliberately
-// in-memory only -- no database calls anywhere in this file. Phase 11
-// replaces the "create a brand-new empty Y.Doc" branch in getOrCreateRoom
-// below with actually loading persisted state (documentService's
-// loadDocumentState), and adds a snapshot flush + short grace period to
-// removeClientFromRoom before dropping an emptied room.
+// In-memory room registry: documentId -> Room.
 const rooms = new Map();
+
+// In-flight room creations: documentId -> Promise<Room>. Guards against a
+// race where two clients join the same not-yet-open document at nearly the
+// same time -- without this, both could see `rooms` miss and each start
+// their own loadDocumentState() call, producing two different Y.Docs and
+// silently losing whichever client got attached to the one that didn't win
+// the final `rooms.set`.
+const roomCreationPromises = new Map();
+
+// Pending empty-room cleanup timers: documentId -> Timeout.
+const pendingCleanups = new Map();
+const ROOM_EMPTY_GRACE_PERIOD_MS = 5000;
 
 export class Room {
   constructor(documentId, yDoc) {
@@ -17,20 +24,37 @@ export class Room {
   }
 }
 
-// Returns the existing in-memory room for documentId, creating one with a
-// fresh, empty Y.Doc if it doesn't exist yet.
-export function getOrCreateRoom(documentId) {
-  let room = rooms.get(documentId);
-  if (!room) {
-    room = new Room(documentId, new Y.Doc());
-    rooms.set(documentId, room);
-    logger.info({ documentId }, 'created new in-memory room');
+// Returns the existing in-memory room for documentId, or creates one by
+// hydrating it via documentService.loadDocumentState (snapshot + operation
+// log replay — see documentService.js for what that means today vs. once
+// Phase 11 adds persistence-on-write).
+export async function getOrCreateRoom(documentId) {
+  const existing = rooms.get(documentId);
+  if (existing) {
+    return existing;
   }
+
+  let creating = roomCreationPromises.get(documentId);
+  if (!creating) {
+    creating = createRoom(documentId);
+    roomCreationPromises.set(documentId, creating);
+    creating.finally(() => roomCreationPromises.delete(documentId));
+  }
+  return creating;
+}
+
+async function createRoom(documentId) {
+  const yDoc = await documentService.loadDocumentState(documentId);
+  const room = new Room(documentId, yDoc);
+  rooms.set(documentId, room);
+  logger.info({ documentId }, 'created new in-memory room');
   return room;
 }
 
-// Registers a connected client (a ws connection) in the room.
+// Registers a connected client (a ws connection) in the room. Cancels any
+// pending empty-room cleanup, since the room is no longer empty.
 export function addClientToRoom(room, client, user) {
+  clearPendingCleanup(room.documentId);
   room.clients.set(client, user);
   logger.info(
     { documentId: room.documentId, userId: user.userId, roomSize: room.clients.size },
@@ -38,8 +62,10 @@ export function addClientToRoom(room, client, user) {
   );
 }
 
-// Removes a client from the room. If the room is now empty, it's dropped
-// from the in-memory registry immediately.
+// Removes a client from the room. If the room is now empty, it isn't torn
+// down immediately -- a short grace period lets the same user reconnect
+// (e.g. a brief network blip, or navigating between documents) without
+// forcing a full reload of the room's state.
 export function removeClientFromRoom(room, client) {
   const user = room.clients.get(client);
   room.clients.delete(client);
@@ -48,8 +74,35 @@ export function removeClientFromRoom(room, client) {
     'client removed from room'
   );
   if (room.clients.size === 0) {
-    rooms.delete(room.documentId);
-    logger.info({ documentId: room.documentId }, 'room emptied, removed from memory');
+    scheduleRoomCleanup(room);
+  }
+}
+
+function scheduleRoomCleanup(room) {
+  clearPendingCleanup(room.documentId);
+  const timeoutId = setTimeout(() => {
+    pendingCleanups.delete(room.documentId);
+    // Only remove if still empty and still the current room for this
+    // documentId -- someone may have reconnected during the grace period.
+    if (room.clients.size === 0 && rooms.get(room.documentId) === room) {
+      rooms.delete(room.documentId);
+      logger.info(
+        { documentId: room.documentId },
+        'room emptied and grace period elapsed, removed from memory'
+      );
+    }
+  }, ROOM_EMPTY_GRACE_PERIOD_MS);
+  // Let the process exit if this timer is the only thing keeping it alive
+  // (matters for tests and clean shutdown).
+  timeoutId.unref?.();
+  pendingCleanups.set(room.documentId, timeoutId);
+}
+
+function clearPendingCleanup(documentId) {
+  const existing = pendingCleanups.get(documentId);
+  if (existing) {
+    clearTimeout(existing);
+    pendingCleanups.delete(documentId);
   }
 }
 
