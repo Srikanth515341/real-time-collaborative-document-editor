@@ -127,6 +127,19 @@ curl -X POST http://localhost:4000/api/documents \
   -d '{"title":"Q3 Roadmap"}'
 ```
 
+## Frontend
+
+React + react-router-dom. Register/log in at `/login` and `/register`, then the dashboard (`/`)
+lists your documents and lets you create one; opening a document (`/documents/:id`) shows its
+metadata, a placeholder where the real-time editor lands in Phase 8, and — for the document's
+owner — an access panel to grant/revoke `editor`/`viewer` roles by email.
+
+**Token storage**: the access token lives in memory only (never in `localStorage`/
+`sessionStorage`); the refresh token (plus a small cached display profile) lives in
+`sessionStorage`, so a page reload doesn't force a re-login but a closed tab doesn't leave a
+lingering credential. This is a deliberate tradeoff, not a default — see `CLAUDE.md`'s Phase 5
+notes for the full reasoning and what a stronger (httpOnly-cookie) version would need.
+
 ## Docker build gotcha (fixed, kept here as a note)
 
 Both `server/` and `client/` need a `.dockerignore` excluding `node_modules` — without it,

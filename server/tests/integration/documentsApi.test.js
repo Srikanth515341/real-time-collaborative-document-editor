@@ -227,6 +227,25 @@ test('granting the owner role through the endpoint is rejected', async () => {
   assert.equal(res.status, 400);
 });
 
+test("granting editor/viewer to the current owner's own email is rejected and does not downgrade their role", async () => {
+  const owner = await registerUser('Owner');
+  const doc = await createDocument(owner.accessToken);
+
+  const res = await api(`/api/documents/${doc.id}/permissions`, {
+    method: 'POST',
+    token: owner.accessToken,
+    body: { email: owner.email, role: 'editor' },
+  });
+  assert.equal(res.status, 400);
+
+  const { rows } = await pool.query(
+    'SELECT role FROM document_permissions WHERE document_id = $1 AND user_id = $2',
+    [doc.id, owner.id]
+  );
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].role, 'owner');
+});
+
 test("revoking the document owner's own permission is rejected", async () => {
   const owner = await registerUser('Owner');
   const doc = await createDocument(owner.accessToken);
