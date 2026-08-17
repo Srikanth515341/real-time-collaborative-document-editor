@@ -11,7 +11,10 @@
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "format": "prettier --write .",
-    "test": "echo \"no tests yet (added from Phase 1 onward)\" && exit 0"
+    "migrate": "node src/db/migrate.js",
+    "test:reset-db": "node --import ./tests/env.setup.js src/db/resetTestDb.js",
+    "pretest": "npm run test:reset-db",
+    "test": "node --import ./tests/env.setup.js --test --test-concurrency=1 \"tests/**/*.test.js\""
   },
   "dependencies": {
     "bcrypt": "^5.1.1",
