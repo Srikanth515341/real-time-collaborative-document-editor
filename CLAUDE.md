@@ -35,15 +35,24 @@ server/
     config.js       — the ONLY module that reads process.env directly; fails fast at import
                       time if a required var is missing
     routes/
-      auth.routes.js  — POST /api/auth/{register,login,refresh}, mounted at /api/auth
-                        [document/permission routes are Phase 4+]
+      auth.routes.js         — POST /api/auth/{register,login,refresh}, mounted at /api/auth
+      documents.routes.js    — full documents REST API, mounted at /api/documents; every
+                                route runs authenticate, writes also run requireRole(...)
+      permissions.routes.js  — mounted at /api/documents/:id/permissions (mergeParams);
+                                owner-only; blocks granting 'owner' or revoking the owner
     services/
       authService.js       — bcrypt hashing (cost 12), access+refresh token issuance,
                               refresh-token rotation
       permissionService.js — satisfiesRole(actual, required); owner > editor > viewer
-      documentService.js   — ensureUserCanAccess() only so far (rest is Phase 4+)
+      documentService.js   — ensureUserCanAccess(); createNewDocument() (atomic doc +
+                              owner-grant via withTransaction); loadDocumentState() (returns
+                              latest snapshot only for now — full Yjs hydration is Phase 7)
     db/            — query functions (parameterized SQL via pg)
       pool.js              — shared pg.Pool, built from config.databaseUrl
+      withTransaction.js   — runs a callback inside BEGIN/COMMIT/ROLLBACK on one checked-out
+                              client; documents.repo.createDocument and
+                              permissions.repo.grantPermission accept an optional trailing
+                              `client` param (default: pool) so they can share one transaction
       applyMigrations.js   — shared migration-runner logic
       migrate.js           — dev migration runner (npm run migrate)
       resetTestDb.js       — destructive test-DB reset (npm run test:reset-db)
@@ -53,8 +62,11 @@ server/
       errorHandler.js — centralized Express error handler (mounted last); logs full error
                         server-side, returns only { error: { code, message } } to the client
       authenticate.js — verifies Authorization: Bearer <token>, sets req.user, 401 on
-                        anything missing/malformed/expired/tampered (not wired into any
-                        route yet — no protected routes exist until Phase 4+)
+                        anything missing/malformed/expired/tampered; mounted on every
+                        documents/permissions route since Phase 4
+      requireRole.js  — factory: requireRole('editor') etc.; calls documentService's
+                        ensureUserCanAccess against req.params.id, 403 via errorHandler on
+                        denial
     utils/
       logger.js       — pino structured logger (no console.log anywhere in the codebase)
       jwt.js          — sign(payload)/verify(token) helpers, access-token secret by default
@@ -62,8 +74,8 @@ server/
                         PermissionError, NotFoundError, ConflictError) carrying
                         statusCode/code for errorHandler
     app.js          — Express app construction (no listener — testable); CORS locked to
-                      config.corsOrigin, auth routes mounted, errorHandler mounted last,
-                      GET /healthz checks the DB
+                      config.corsOrigin, auth + documents routes mounted, errorHandler
+                      mounted last, GET /healthz checks the DB
     index.js        — entrypoint; starts the HTTP listener, has process-level
                       unhandledRejection/uncaughtException logging
   tests/
@@ -74,6 +86,9 @@ server/
     services/authService.test.js, permissionService.test.js, documentService.test.js
     routes/auth.routes.test.js — full register/login/refresh integration tests against a
                                   real ephemeral server + test DB
+    integration/documentsApi.test.js — full documents+permissions API lifecycle against a
+                                        real ephemeral server + test DB (create/list/rename/
+                                        delete, cascade, grant/revoke, every 403 negative case)
     db/             — repo-layer tests, one file per repo module, run against a real
                       disposable Postgres database (server/tests/db/helpers.js has the
                       shared TRUNCATE/fixture helpers)
@@ -179,7 +194,7 @@ docker-compose.yml
   the running Docker server and confirming `503`/`200` transitions correctly.
 - 32 passing tests total (7 new: `config.test.js`, `jwt.test.js`, `errorHandler.test.js`).
 
-**Phase 3 — Authentication & Authorization System: ✅ Done**
+**Phase 3 — Authentication & Authorization System: ✅ Done (merged to main)**
 
 - `authService.js` — bcrypt password hashing (cost factor 12, documented reasoning in comments);
   `issueTokenPair()` issues a signed access token (via Phase 2's `jwt.js`) plus an opaque
@@ -214,6 +229,38 @@ docker-compose.yml
   for pure-JS deps but corrupting `bcrypt`'s native binary (`invalid ELF header`) once this phase
   introduced it. Added `.dockerignore` to both `server/` and `client/` (client had the same
   latent bug, just never surfaced since it has no native deps).
-**Next: Phase 4 — Document & Permissions REST API**
+**Phase 4 — Document & Permissions REST API: ✅ Done**
 
-Branch in progress: `phase-3-auth` (not yet merged — pending user verification and commit).
+- `documentService.createNewDocument()` — creates the document row and grants the creator
+  'owner' permission in a single atomic DB transaction (new `db/withTransaction.js` helper;
+  `documents.repo.createDocument` and `permissions.repo.grantPermission` gained an optional
+  trailing `client` param, backward-compatible with every existing call site, so they can
+  share one transaction). A document can never exist without an owner.
+- `documentService.loadDocumentState()` — Phase 4 slice only: returns the latest snapshot row
+  as-is. Full Yjs hydration + operation-log replay is Phase 7.
+- `requireRole.js` — middleware factory wrapping `ensureUserCanAccess`; 403 on denial.
+- `documents.routes.js` — full REST table from PRD.md 10.5 (list, create, get, patch, delete,
+  `GET /:id/versions`), every route behind `authenticate`, writes also behind the correct
+  `requireRole`.
+- `permissions.routes.js` (mounted at `/api/documents/:id/permissions`, owner-only) — list,
+  grant, revoke. Two deliberate constraints beyond the literal endpoint table, to protect PRD
+  10.7's "exactly one owner per document" invariant: **granting `role: 'owner'` is rejected**
+  (only `editor`/`viewer` are grantable — ownership transfer isn't in scope), and **revoking the
+  owner's own permission is rejected** (would orphan the document; deleting it is the only way
+  to remove an owner grant).
+- Requesting a document you have no permission on (or that doesn't exist) returns **403, not
+  404** — `ensureUserCanAccess` can't distinguish "no such document" from "no such permission
+  row," and deliberately doesn't leak which one it is, consistent with Phase 3's login-endpoint
+  stance on not revealing information to unauthorized requests.
+- 10 new tests (69 total): full lifecycle, atomic owner-grant, cascade-on-delete, editor can
+  write after grant, viewer 403 on every write, non-owner 403 on all permission management,
+  revoke-then-access-denied, both new constraints (owner-grant rejection, self-revoke
+  rejection), and an auth-required sweep.
+- Verified live against Docker end-to-end (curl walkthrough matching every test scenario,
+  including checking `document_permissions` row counts in psql before/after delete to confirm
+  the cascade).
+
+**Next: Phase 5 — Frontend Foundation**
+
+Branch in progress: `phase-4-documents-api` (not yet merged — pending user verification and
+commit).

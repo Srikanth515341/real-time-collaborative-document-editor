@@ -14,8 +14,11 @@ function mapRow(row) {
 }
 
 // Inserts a new document row owned by ownerId. Returns the created Document.
-export async function createDocument({ ownerId, title }) {
-  const { rows } = await pool.query(
+// Accepts an optional trailing `client` (defaulting to the shared pool) so
+// documentService.createNewDocument can run this inside the same transaction
+// as the owner permission grant.
+export async function createDocument({ ownerId, title }, client = pool) {
+  const { rows } = await client.query(
     `INSERT INTO documents (owner_id, title)
      VALUES ($1, COALESCE($2, 'Untitled Document'))
      RETURNING *`,
