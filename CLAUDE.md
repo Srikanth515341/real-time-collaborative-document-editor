@@ -34,35 +34,54 @@ server/
   src/
     config.js       — the ONLY module that reads process.env directly; fails fast at import
                       time if a required var is missing
-    routes/       — Express route handlers (thin, delegate to services) [empty, Phase 4+]
-    services/      — business logic [empty, Phase 6+]
+    routes/
+      auth.routes.js  — POST /api/auth/{register,login,refresh}, mounted at /api/auth
+                        [document/permission routes are Phase 4+]
+    services/
+      authService.js       — bcrypt hashing (cost 12), access+refresh token issuance,
+                              refresh-token rotation
+      permissionService.js — satisfiesRole(actual, required); owner > editor > viewer
+      documentService.js   — ensureUserCanAccess() only so far (rest is Phase 4+)
     db/            — query functions (parameterized SQL via pg)
       pool.js              — shared pg.Pool, built from config.databaseUrl
       applyMigrations.js   — shared migration-runner logic
       migrate.js           — dev migration runner (npm run migrate)
       resetTestDb.js       — destructive test-DB reset (npm run test:reset-db)
       *.repo.js            — one per table/domain: users, documents, permissions,
-                              snapshots, operationLog
+                              snapshots, operationLog, refreshTokens
     middleware/
       errorHandler.js — centralized Express error handler (mounted last); logs full error
                         server-side, returns only { error: { code, message } } to the client
+      authenticate.js — verifies Authorization: Bearer <token>, sets req.user, 401 on
+                        anything missing/malformed/expired/tampered (not wired into any
+                        route yet — no protected routes exist until Phase 4+)
     utils/
       logger.js       — pino structured logger (no console.log anywhere in the codebase)
-      jwt.js          — sign(payload)/verify(token) helpers; not wired into any route yet
-                        (Phase 3 consumes these)
+      jwt.js          — sign(payload)/verify(token) helpers, access-token secret by default
+      errors.js        — AppError + typed subclasses (ValidationError, AuthError,
+                        PermissionError, NotFoundError, ConflictError) carrying
+                        statusCode/code for errorHandler
     app.js          — Express app construction (no listener — testable); CORS locked to
-                      config.corsOrigin, errorHandler mounted last, GET /healthz checks the DB
+                      config.corsOrigin, auth routes mounted, errorHandler mounted last,
+                      GET /healthz checks the DB
     index.js        — entrypoint; starts the HTTP listener, has process-level
                       unhandledRejection/uncaughtException logging
   tests/
     env.setup.js    — preloaded via `node --import`; points DATABASE_URL (and now
                       CORS_ORIGIN/JWT secrets, since config.js requires them) at server/.env.test
     config.test.js, jwt.test.js, errorHandler.test.js — unit/integration tests for the skeleton
+    middleware/authenticate.test.js
+    services/authService.test.js, permissionService.test.js, documentService.test.js
+    routes/auth.routes.test.js — full register/login/refresh integration tests against a
+                                  real ephemeral server + test DB
     db/             — repo-layer tests, one file per repo module, run against a real
                       disposable Postgres database (server/tests/db/helpers.js has the
                       shared TRUNCATE/fixture helpers)
   .env              — host-side env (gitignored; DATABASE_URL uses `localhost`, not `postgres`)
   .env.test         — test-DB env (gitignored; see .env.test.example)
+  .dockerignore     — excludes node_modules from the build context (missing since Phase 0;
+                      fixed in Phase 3 — was silently overwriting the image's Linux-built
+                      native modules with the host's, breaking bcrypt in Docker)
 client/
   src/
     App.jsx, main.jsx, etc.
@@ -134,7 +153,7 @@ docker-compose.yml
 - `TECHNICAL_DESIGN.md` still only has Section 4 pasted in — the rest (Sections 1–3, 5–10) will
   be added as later phases need them.
 
-**Phase 2 — Backend Application Skeleton: ✅ Done**
+**Phase 2 — Backend Application Skeleton: ✅ Done (merged to main)**
 
 - `config.js` — single source of truth for env vars; fails fast at import time if
   `DATABASE_URL`, `CORS_ORIGIN`, `JWT_ACCESS_SECRET`, or `JWT_REFRESH_SECRET` is missing.
@@ -160,7 +179,41 @@ docker-compose.yml
   the running Docker server and confirming `503`/`200` transitions correctly.
 - 32 passing tests total (7 new: `config.test.js`, `jwt.test.js`, `errorHandler.test.js`).
 
-**Next: Phase 3 — Authentication & Authorization System**
+**Phase 3 — Authentication & Authorization System: ✅ Done**
 
-Branch in progress: `phase-2-backend-skeleton` (not yet merged — pending user verification and
-commit).
+- `authService.js` — bcrypt password hashing (cost factor 12, documented reasoning in comments);
+  `issueTokenPair()` issues a signed access token (via Phase 2's `jwt.js`) plus an opaque
+  64-byte random refresh token, stored in `refresh_tokens` hashed with SHA-256 (not bcrypt —
+  refresh tokens are already high-entropy, so a fast deterministic hash is correct here and
+  enables direct lookup by value; bcrypt is for low-entropy user-chosen secrets like passwords).
+  `rotateRefreshToken()` deletes the presented token immediately (single-use) before issuing a
+  new pair, so a stolen/reused old refresh token is always rejected.
+- Added `db/refreshTokens.repo.js` — wasn't built in Phase 1 even though the table existed;
+  needed now, follows the same repo conventions.
+- `auth.routes.js` — `POST /api/auth/{register,login,refresh}`, mounted at `/api/auth` in
+  `app.js`. Register validates email format + min 8-char password, returns 409 on duplicate
+  email (with a defense-in-depth catch on the DB unique-constraint race). Login returns the
+  *identical* generic 401 for a wrong password and a nonexistent email — verified both by test
+  and live curl — and `verifyPassword` always runs a real bcrypt comparison (against a fixed
+  dummy hash when no user was found) so response timing doesn't leak account existence either.
+- `authenticate.js` — Bearer-token middleware, not wired into any route yet (nothing to protect
+  until Phase 4+ adds document routes).
+- `permissionService.js` (`satisfiesRole`) and the first slice of `documentService.js`
+  (`ensureUserCanAccess`) — the rest of `documentService.js` is Phase 4.
+- `utils/errors.js` — added (not explicitly listed in the phase scope, but needed for
+  `errorHandler.js`'s statusCode/code convention to actually be used consistently across auth
+  routes/services): `AppError` + `ValidationError`/`AuthError`/`PermissionError`/`NotFoundError`/
+  `ConflictError`.
+- 27 new tests (59 total): unit tests for `authService`/`authenticate`/`permissionService`/
+  `documentService`, plus a full integration suite for the three routes against a real ephemeral
+  server + test database (register/login/refresh happy paths, weak password, duplicate email,
+  wrong-password-vs-unknown-email parity, rotation + reuse rejection).
+- **Found and fixed a real Docker bug**: `server/.dockerignore` never existed (since Phase 0).
+  `COPY . .` in `server/Dockerfile` was copying the host's own `node_modules` (Windows-native
+  binaries) into the image on top of the Linux-built ones from `npm install`, silently working
+  for pure-JS deps but corrupting `bcrypt`'s native binary (`invalid ELF header`) once this phase
+  introduced it. Added `.dockerignore` to both `server/` and `client/` (client had the same
+  latent bug, just never surfaced since it has no native deps).
+**Next: Phase 4 — Document & Permissions REST API**
+
+Branch in progress: `phase-3-auth` (not yet merged — pending user verification and commit).
