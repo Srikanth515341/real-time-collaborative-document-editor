@@ -1,5 +1,6 @@
 import pg from 'pg';
-import { logger } from '../logger.js';
+import { config } from '../config.js';
+import { logger } from '../utils/logger.js';
 import { applyMigrations } from './applyMigrations.js';
 
 // Drops and recreates the public schema, then re-applies every migration.
@@ -7,8 +8,7 @@ import { applyMigrations } from './applyMigrations.js';
 // something containing "test" — this is destructive and must never be
 // pointed at a dev or prod database by accident.
 async function main() {
-  const connectionString = process.env.DATABASE_URL || '';
-  const dbName = new URL(connectionString).pathname.replace(/^\//, '');
+  const dbName = new URL(config.databaseUrl).pathname.replace(/^\//, '');
   if (!dbName.includes('test')) {
     throw new Error(
       `Refusing to reset database "${dbName}" — resetTestDb.js only runs against a ` +
@@ -16,7 +16,7 @@ async function main() {
     );
   }
 
-  const client = new pg.Client({ connectionString });
+  const client = new pg.Client({ connectionString: config.databaseUrl });
   await client.connect();
   try {
     await client.query('DROP SCHEMA public CASCADE');

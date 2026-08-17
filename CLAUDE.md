@@ -32,21 +32,32 @@ server/
     001_init.sql    — full schema (users, documents, document_permissions,
                        document_snapshots, operation_log, refresh_tokens)
   src/
+    config.js       — the ONLY module that reads process.env directly; fails fast at import
+                      time if a required var is missing
     routes/       — Express route handlers (thin, delegate to services) [empty, Phase 4+]
     services/      — business logic [empty, Phase 6+]
     db/            — query functions (parameterized SQL via pg)
-      pool.js              — shared pg.Pool
+      pool.js              — shared pg.Pool, built from config.databaseUrl
       applyMigrations.js   — shared migration-runner logic
       migrate.js           — dev migration runner (npm run migrate)
       resetTestDb.js       — destructive test-DB reset (npm run test:reset-db)
       *.repo.js            — one per table/domain: users, documents, permissions,
                               snapshots, operationLog
-    middleware/     — JWT verification, error handling [empty, Phase 3+]
-    websocket/      — connection handling, room management, broadcast logic [empty, Phase 7+]
-    app.js          — Express app construction (no listener — testable)
-    index.js        — entrypoint, starts the HTTP listener
+    middleware/
+      errorHandler.js — centralized Express error handler (mounted last); logs full error
+                        server-side, returns only { error: { code, message } } to the client
+    utils/
+      logger.js       — pino structured logger (no console.log anywhere in the codebase)
+      jwt.js          — sign(payload)/verify(token) helpers; not wired into any route yet
+                        (Phase 3 consumes these)
+    app.js          — Express app construction (no listener — testable); CORS locked to
+                      config.corsOrigin, errorHandler mounted last, GET /healthz checks the DB
+    index.js        — entrypoint; starts the HTTP listener, has process-level
+                      unhandledRejection/uncaughtException logging
   tests/
-    env.setup.js    — preloaded via `node --import`; points DATABASE_URL at server/.env.test
+    env.setup.js    — preloaded via `node --import`; points DATABASE_URL (and now
+                      CORS_ORIGIN/JWT secrets, since config.js requires them) at server/.env.test
+    config.test.js, jwt.test.js, errorHandler.test.js — unit/integration tests for the skeleton
     db/             — repo-layer tests, one file per repo module, run against a real
                       disposable Postgres database (server/tests/db/helpers.js has the
                       shared TRUNCATE/fixture helpers)
@@ -95,7 +106,7 @@ docker-compose.yml
 - ESLint + Prettier configured and passing in both `server/` and `client/`.
 - GitHub Actions CI (`.github/workflows/ci.yml`) runs lint for both packages on every push/PR.
 
-**Phase 1 — Database Schema, Migrations & Data Access Layer: ✅ Done**
+**Phase 1 — Database Schema, Migrations & Data Access Layer: ✅ Done (merged to main)**
 
 - `server/migrations/001_init.sql` — full schema exactly matching PRD.md Section 10.4 (6 tables,
   the `document_permissions.role` CHECK constraint, both indexes). Verified against a live
@@ -123,6 +134,33 @@ docker-compose.yml
 - `TECHNICAL_DESIGN.md` still only has Section 4 pasted in — the rest (Sections 1–3, 5–10) will
   be added as later phases need them.
 
-**Next: Phase 2 — Backend Application Skeleton**
+**Phase 2 — Backend Application Skeleton: ✅ Done**
 
-Branch in progress: `phase-1-db-schema` (not yet merged — pending user verification and commit).
+- `config.js` — single source of truth for env vars; fails fast at import time if
+  `DATABASE_URL`, `CORS_ORIGIN`, `JWT_ACCESS_SECRET`, or `JWT_REFRESH_SECRET` is missing.
+  `PORT`, `NODE_ENV`, `LOG_LEVEL`, and JWT expiry vars have sensible defaults.
+- Moved `logger.js` from `server/src/logger.js` (Phase 0) into `server/src/utils/logger.js` to
+  match this phase's conventions — updated every file that imported the old path
+  (`app.js`, `index.js`, `applyMigrations.js`, `migrate.js`, `resetTestDb.js`).
+- Retrofitted `pool.js`, `migrate.js`, and `resetTestDb.js` to read `config.databaseUrl` instead
+  of `process.env.DATABASE_URL` directly, so `config.js` really is the only file reading
+  `process.env` — this also meant expanding `.env.test`/`.env.test.example` to include
+  `CORS_ORIGIN` and both JWT secrets (previously just `DATABASE_URL`), since anything importing
+  a repo module now transitively imports `config.js`.
+- `utils/jwt.js` — `sign(payload, opts?)` / `verify(token, opts?)`, defaulting to the access-token
+  secret/expiry. Refresh tokens per PRD 10.6 are opaque, hashed, DB-stored tokens, not JWTs, so
+  this pair is deliberately generic rather than access/refresh-specific — flagged for
+  reconsideration if Phase 3 needs something different.
+- `middleware/errorHandler.js` — mounted last in `app.js`; logs full errors server-side via pino,
+  returns only `{ error: { code, message } }` to the client. Verified via an integration test
+  using a throwaway Express app (not a permanent debug route) that the response never leaks
+  internal error text.
+- `GET /healthz` now runs `SELECT 1` against the DB pool and reports `db: 'ok'|'error'` without
+  ever crashing the process — verified live by stopping/restarting the Postgres container against
+  the running Docker server and confirming `503`/`200` transitions correctly.
+- 32 passing tests total (7 new: `config.test.js`, `jwt.test.js`, `errorHandler.test.js`).
+
+**Next: Phase 3 — Authentication & Authorization System**
+
+Branch in progress: `phase-2-backend-skeleton` (not yet merged — pending user verification and
+commit).
