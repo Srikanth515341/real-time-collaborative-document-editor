@@ -45,6 +45,11 @@ cd server
 cp .env.test.example .env.test   # then edit if your credentials differ
 ```
 
+`config.js` fails fast if any required env var is missing (`DATABASE_URL`, `CORS_ORIGIN`,
+`JWT_ACCESS_SECRET`, `JWT_REFRESH_SECRET`), so `.env.test` needs all of them even though the test
+suite only exercises the database layer directly — anything importing a repo module pulls in
+`pool.js` → `config.js`.
+
 Then run:
 
 ```bash
@@ -55,6 +60,20 @@ This automatically drops/recreates the test database's schema and re-applies mig
 each run (`pretest` → `test:reset-db`), so tests always start from a clean, known schema.
 `resetTestDb.js` refuses to run against any database whose name doesn't contain `test`, as a
 safeguard against accidentally wiping dev data.
+
+## Application skeleton
+
+- `server/src/config.js` is the **only** module that reads `process.env` directly — it validates
+  every required var at import time and fails fast (clear error, non-zero exit) if one's missing.
+  Everything else imports `config` from there.
+- `server/src/utils/logger.js` — structured pino logging. No `console.log` anywhere in the
+  codebase from this phase forward.
+- `server/src/middleware/errorHandler.js` — centralized Express error handler (mounted last in
+  `app.js`). Logs the full error server-side, but only ever returns
+  `{ error: { code, message } }` to the client — never a stack trace.
+- `GET /healthz` now also checks the database (`SELECT 1`) and reports it without ever crashing
+  the process if the DB is unreachable: `200 { status: 'ok', db: 'ok' }` when healthy, or
+  `503 { status: 'ok', db: 'error' }` when the DB can't be reached.
 
 This README is built out progressively as each phase lands, with a full polish pass in the final
 phase.
