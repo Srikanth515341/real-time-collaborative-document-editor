@@ -1,10 +1,12 @@
 import { logger } from '../utils/logger.js';
 import { handleJoinDocument } from './handlers/joinDocument.js';
 import { handleSyncUpdate } from './handlers/syncUpdate.js';
+import { handleLeaveDocument } from './handlers/leaveDocument.js';
 
 const handlers = {
   'join-document': handleJoinDocument,
   'sync-update': handleSyncUpdate,
+  'leave-document': handleLeaveDocument,
 };
 
 function sendError(client, code, message) {
@@ -13,7 +15,10 @@ function sendError(client, code, message) {
 
 // Parses an incoming raw WebSocket message and dispatches it to the matching
 // handler by `type`. An unparseable message or an unknown type gets back a
-// clear error response instead of being silently dropped.
+// clear error response instead of being silently dropped. Handlers may be
+// async (join-document and sync-update now do real DB/JWT work) — errors
+// they don't handle internally are caught here so they can never take down
+// the connection or the process silently.
 export function routeMessage(client, rawMessage) {
   let message;
   try {
@@ -30,5 +35,7 @@ export function routeMessage(client, rawMessage) {
     return;
   }
 
-  handler(client, message);
+  Promise.resolve(handler(client, message)).catch((err) => {
+    logger.error({ err, messageType: message.type }, 'unhandled error in websocket message handler');
+  });
 }

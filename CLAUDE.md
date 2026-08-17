@@ -45,8 +45,13 @@ server/
                               refresh-token rotation
       permissionService.js — satisfiesRole(actual, required); owner > editor > viewer
       documentService.js   — ensureUserCanAccess(); createNewDocument() (atomic doc +
-                              owner-grant via withTransaction); loadDocumentState() (returns
-                              latest snapshot only for now — full Yjs hydration is Phase 7)
+                              owner-grant via withTransaction); loadDocumentState() — as of
+                              Phase 7, fully implemented: returns a hydrated Y.Doc (snapshot
+                              + operation-log replay), used by roomManager.getOrCreateRoom.
+                              NOT what documents.routes.js's GET /:id uses for its
+                              `latestSnapshot` field anymore — that goes straight to
+                              snapshotsRepo.getLatestSnapshot() for the raw, JSON-serializable
+                              row, since loadDocumentState's return type changed shape
     db/            — query functions (parameterized SQL via pg)
       pool.js              — shared pg.Pool, built from config.databaseUrl
       withTransaction.js   — runs a callback inside BEGIN/COMMIT/ROLLBACK on one checked-out
@@ -68,15 +73,30 @@ server/
                         ensureUserCanAccess against req.params.id, 403 via errorHandler on
                         denial
     websocket/
-      roomManager.js    — in-memory Room registry (documentId -> {yDoc, clients}); Phase 6
-                          is in-memory only, no DB calls — Phase 11 adds real persistence
+      roomManager.js    — in-memory Room registry (documentId -> {yDoc, clients}). Rooms are
+                          hydrated via documentService.loadDocumentState (snapshot + op-log
+                          replay — usually empty today, since nothing writes either yet;
+                          Phase 11 adds persistence-on-write). getOrCreateRoom is async and
+                          coalesces concurrent creation attempts for the same documentId via
+                          an in-flight-promise map, to avoid a duplicate-load race. Empty
+                          rooms aren't torn down immediately — a 5s grace period
+                          (ROOM_EMPTY_GRACE_PERIOD_MS) allows a quick reconnect without a
+                          full reload.
       wsServer.js        — attaches `ws` to the same HTTP server as Express (one port)
-      messageRouter.js   — message `type` -> handler dispatch, UNKNOWN_MESSAGE_TYPE on a miss
+      messageRouter.js   — message `type` -> handler dispatch (join-document, sync-update,
+                          leave-document), UNKNOWN_MESSAGE_TYPE on a miss; wraps handler
+                          calls so an unhandled rejection is logged, never crashes the process
       handlers/
-        joinDocument.js  — INTENTIONALLY has no JWT/permission check yet (see the comment
-                          block at the top of the file) — Phase 7 adds it
-        syncUpdate.js    — Y.applyUpdate + broadcast to the room; malformed updates are
-                          logged and dropped, never crash the room
+        joinDocument.js  — as of Phase 7, requires a valid JWT (jwt.js's verify()) and at
+                          least 'viewer' access (documentService.ensureUserCanAccess) —
+                          same standard as every REST write path. Denial sends a clear error
+                          then closes the socket (custom codes: 4001 unauthorized, 4003
+                          permission denied)
+        syncUpdate.js    — requires at least 'editor' access before applying/broadcasting;
+                          denial sends PERMISSION_DENIED and does neither. Y.applyUpdate
+                          failures are logged and dropped, never crash the room
+        leaveDocument.js — explicit leave-document message; same removeClientFromRoom path
+                          the ws 'close' event uses, so both get the same grace period
     utils/
       logger.js       — pino structured logger (no console.log anywhere in the codebase)
       jwt.js          — sign(payload)/verify(token) helpers, access-token secret by default
@@ -108,6 +128,14 @@ server/
                               no DB): identical final state regardless of update order,
                               across 2-way/3-way(all 6 permutations)/idempotency/randomized-
                               shuffle scenarios. The single most important test in the project.
+    integration/multiClientSync.test.js — real HTTP+WS server (mirrors index.js's wiring
+                              exactly), real JWTs via the actual register endpoint, real
+                              grants via the actual permissions REST API: editor sync-update
+                              accepted+broadcast, viewer sync-update rejected (and
+                              positively confirmed NOT broadcast, via a race against a
+                              timeout), invalid JWT rejected + socket closed, no-grant
+                              stranger rejected at join, and a late joiner receiving the
+                              room's already-edited in-memory state via loadDocumentState.
     db/             — repo-layer tests, one file per repo module, run against a real
                       disposable Postgres database (server/tests/db/helpers.js has the
                       shared TRUNCATE/fixture helpers)
@@ -351,7 +379,7 @@ docker-compose.yml
   repeat unauthenticated redirect, and a page-reload session-restore check. Zero console errors,
   zero failed/5xx requests, across two full runs after the StrictMode fix.
 
-**Phase 6 — CRDT Sync Engine — Isolated Proof of Concept: ✅ Done**
+**Phase 6 — CRDT Sync Engine — Isolated Proof of Concept: ✅ Done (merged to main)**
 
 - Added `yjs`. Built the WebSocket layer entirely in-memory, deliberately isolated from the rest
   of the product per this phase's explicit scope: no DB persistence (Phase 11), no auth on the
@@ -384,6 +412,50 @@ docker-compose.yml
   (react-router-dom) — this time with `yjs`. Documented it properly in the README this time
   (`--force-recreate --renew-anon-volumes`) instead of just fixing it silently again.
 
-**Next: Phase 7 — WebSocket Gateway — Production Integration**
+**Phase 7 — WebSocket Gateway — Production Integration: ✅ Done**
 
-Branch in progress: `phase-6-crdt-poc` (not yet merged — pending user verification and commit).
+- `joinDocument.js` now requires a real JWT (`jwt.js`'s `verify()`, same as REST's
+  `authenticate.js`) and at least `viewer` access (`documentService.ensureUserCanAccess`, the
+  exact function every REST write path uses) — closes the Phase 6 gap where it accepted a bare
+  `userId` at face value. Denial sends a clear error then closes the socket: custom close codes
+  `4001` (unauthorized) and `4003` (permission denied), `1008` for a malformed message, `1011`
+  for an unexpected server error.
+- `syncUpdate.js` now requires at least `editor` access before applying or broadcasting; a
+  denied update is neither applied nor broadcast — sends `PERMISSION_DENIED` back to the sender
+  only.
+- `documentService.loadDocumentState()` is now fully implemented: loads the latest snapshot (if
+  any), replays every operation-log entry created after it, returns a hydrated `Y.Doc`. Since
+  neither snapshot-writing nor operation-log-writing exist until Phase 11, this is almost always
+  an empty `Y.Doc` today — expected, not a bug, and already correct for Phase 11 to build on.
+- **Found and fixed a real regression this change caused**: `loadDocumentState`'s return type
+  changed (raw snapshot row → hydrated `Y.Doc`), but `documents.routes.js`'s REST `GET /:id`
+  (Phase 4) was still calling it expecting the old JSON-serializable shape — `res.json()` on a
+  `Y.Doc` silently serializes to `{}`. Caught by the existing Phase 4 test suite failing
+  (`full document lifecycle`, `{} !== null`), not by anything new. Fixed by having that route
+  call `snapshotsRepo.getLatestSnapshot()` directly instead, since that's what it actually needs
+  — `loadDocumentState` is correctly repurposed for the WebSocket room manager only.
+- `roomManager.getOrCreateRoom` is now async (it awaits `loadDocumentState`), which introduces a
+  real race the Phase 6 version never had: two clients joining the same not-yet-open document at
+  nearly the same time could each start their own DB load and silently strand whichever client
+  attached to the losing one. Fixed with an in-flight-creation-promise map (same coalescing
+  pattern as the frontend's refresh-token dedup from Phase 5) so concurrent joins share one load.
+- Added the grace-period room cleanup TECHNICAL_DESIGN.md Section 4 describes but Phase 6
+  deliberately skipped: an emptied room waits 5s (`ROOM_EMPTY_GRACE_PERIOD_MS`) before being
+  dropped from memory, cancelled if a client (re)joins in the meantime. `leaveDocument.js` (new)
+  and the `ws` `'close'` handler both route through the same `removeClientFromRoom`, so both get
+  this for free.
+- 5 new tests (79 total) in `multiClientSync.test.js`, against a real HTTP+WS server with real
+  JWTs and real permission grants — including positively confirming a viewer's rejected update
+  never reaches other clients (raced against a timeout, not just checking the sender's error).
+- Verified live against Docker with a scripted multi-account WebSocket client (not just the
+  automated suite): editor accepted + broadcast works, viewer rejected at write, invalid JWT
+  rejected + socket closed (confirmed close code `4001`), a stranger with zero grant rejected at
+  join. Also specifically verified the server-restart scenario asked for: joined a room, sent an
+  edit, ran `docker compose restart server`, reconnected and rejoined the same document —
+  succeeded cleanly with an empty room, no crash, `/healthz` fully green afterward. Server logs
+  independently confirmed the 5s grace-period cleanup firing correctly in the live container.
+
+**Next: Phase 8 — Frontend Real-Time Editor Integration**
+
+Branch in progress: `phase-7-websocket-production` (not yet merged — pending user verification
+and commit).

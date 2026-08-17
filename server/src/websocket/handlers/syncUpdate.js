@@ -1,6 +1,7 @@
 import * as Y from 'yjs';
 import { logger } from '../../utils/logger.js';
 import { broadcastToRoom } from '../roomManager.js';
+import { ensureUserCanAccess } from '../../services/documentService.js';
 
 // The single most important function in the whole backend
 // (TECHNICAL_DESIGN.md Section 4): the server never decides whose edit
@@ -10,10 +11,15 @@ import { broadcastToRoom } from '../roomManager.js';
 // final document everywhere (proved in isolation by
 // tests/unit/crdtMerge.test.js).
 //
+// As of this phase, every sync-update is gated by the same 'editor'
+// requirement as the REST write paths (PATCH /api/documents/:id etc.) — a
+// viewer's update is rejected with PERMISSION_DENIED and never applied or
+// broadcast, exactly matching PRD.md Section 10.7's server-side enforcement
+// rule.
+//
 // Persistence (operation_log append + periodic snapshotting) is
-// intentionally NOT done here -- that's Phase 11. This phase proves merge
-// correctness first, in isolation, before anything depends on it.
-export function handleSyncUpdate(client, message) {
+// intentionally NOT done here -- that's Phase 11.
+export async function handleSyncUpdate(client, message) {
   const room = client.room;
   if (!room) {
     client.send(
@@ -24,6 +30,27 @@ export function handleSyncUpdate(client, message) {
       })
     );
     return;
+  }
+
+  try {
+    await ensureUserCanAccess({
+      documentId: room.documentId,
+      userId: client.userId,
+      requiredRole: 'editor',
+    });
+  } catch (err) {
+    if (err.code === 'PERMISSION_DENIED') {
+      client.send(JSON.stringify({ type: 'error', code: 'PERMISSION_DENIED', message: err.message }));
+    } else {
+      logger.error(
+        { err, documentId: room.documentId, userId: client.userId },
+        'unexpected error checking edit permission'
+      );
+      client.send(
+        JSON.stringify({ type: 'error', code: 'INTERNAL_ERROR', message: 'Something went wrong.' })
+      );
+    }
+    return; // Denied -- do NOT apply or broadcast the update.
   }
 
   let update;
