@@ -538,7 +538,7 @@ docker-compose.yml
   in this phase's prompt but still were never pasted into the file — proceeded anyway since the
   prompt itself specified exact backoff timing and hook responsibilities.
 
-**Phase 9 — Multi-Client Convergence Validation & Proof: ✅ Done**
+**Phase 9 — Multi-Client Convergence Validation & Proof: ✅ Done (merged to main)**
 
 This phase added no product features — its only job was rigorous, automated, demoable proof of
 the core convergence claim.
@@ -585,7 +585,18 @@ the core convergence claim.
 - Verified locally: full backend suite (80/80), the E2E spec run **4 consecutive times** with no
   flakes (~20–30s each), lint clean on both packages, production build clean.
 
+**Standalone fix (post-Phase-9, branch `phase-9b-permissions-email-fix`): PermissionsPanel
+userId-vs-email — ✅ Done, uncommitted**
+
+Closes the rough edge flagged since Phase 5 and hit again while writing Phase 9's E2E test.
+`permissions.repo.js`'s `listPermissionsForDocument` now `JOIN`s to `users` and returns each
+grant's `email`/`displayName` alongside `userId`; `PermissionsPanel.jsx` displays `grant.email`
+instead of the raw UUID. No route/API shape removed, only fields added, so nothing else needed
+to change — full backend suite (80/80) and client lint/build stayed green with no other edits.
+Verified live via curl against a rebuilt Docker server. Not yet committed — see the chat for the
+exact staged/uncommitted file list at hand-off.
+
 **Next: Phase 10 — Presence & Live Cursors**
 
-Branch in progress: `phase-9-convergence-proof` (not yet merged — pending user verification and
-commit).
+Branch in progress for Phase 10: not yet started — build on top of
+`phase-9b-permissions-email-fix` once it's merged, or on main if that lands first.

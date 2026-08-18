@@ -48,11 +48,23 @@ export async function getUserRole({ documentId, userId }) {
   return rows[0]?.role ?? null;
 }
 
-// Lists every permission grant for a document.
+// Maps a document_permissions row joined to its user's email/displayName.
+function mapRowWithUser(row) {
+  if (!row) return null;
+  return { ...mapRow(row), email: row.email, displayName: row.display_name };
+}
+
+// Lists every permission grant for a document, including each grantee's
+// email/displayName (joined from users) so callers don't have to show a
+// raw userId in the UI.
 export async function listPermissionsForDocument(documentId) {
   const { rows } = await pool.query(
-    'SELECT * FROM document_permissions WHERE document_id = $1 ORDER BY granted_at ASC',
+    `SELECT p.*, u.email, u.display_name
+     FROM document_permissions p
+     JOIN users u ON u.id = p.user_id
+     WHERE p.document_id = $1
+     ORDER BY p.granted_at ASC`,
     [documentId]
   );
-  return rows.map(mapRow);
+  return rows.map(mapRowWithUser);
 }
