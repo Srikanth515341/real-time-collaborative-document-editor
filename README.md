@@ -267,6 +267,34 @@ Sending `{"type":"not-a-real-type"}` should get back a clear `UNKNOWN_MESSAGE_TY
 sending a `sync-update` with garbage (non-base64/non-Yjs) `update` content should get back
 `INVALID_UPDATE` without crashing the room or the server.
 
+## Proof of correctness
+
+This project's core claim — multiple concurrent users editing the same document with zero data
+loss and correct convergence, regardless of timing — is backed by automated proof at every layer,
+not just a demo that happened to work once:
+
+- **`server/tests/unit/crdtMerge.test.js`** — proves Yjs's convergence guarantee in complete
+  isolation (no server, no network): 2-way and 3-way (all 6 permutations) concurrent edits,
+  duplicate-delivery idempotency, and a 5-client randomized-shuffle stress test.
+- **`server/tests/integration/multiClientSync.test.js`** — proves the same guarantee holds
+  through the *real* server: 3 real authenticated WebSocket clients making genuinely overlapping
+  (same-position) concurrent edits, converging to an identical result across 3 different delivery
+  orderings.
+- **`client/tests/e2e/collaborativeEdit.spec.js`** — proves it through the *real UI*: 3 real
+  browser contexts, 3 real accounts, typing at the same position at the same time, asserting all
+  three browsers' rendered content converges to byte-identical, character-complete text.
+
+```bash
+cd server && npm test                    # includes the 3-client server-side convergence proof
+cd client && npm run test:e2e             # the full end-to-end browser proof (needs the stack running)
+```
+
+Further reading:
+- **[docs/crdt-convergence-explained.md](docs/crdt-convergence-explained.md)** — a plain-language
+  explanation of *why* this works, written to be explainable in an interview with no notes.
+- **[docs/manual-demo-script.md](docs/manual-demo-script.md)** — a precise, numbered script for
+  demonstrating 3-way live editing and offline-reconnect reconciliation live or on video.
+
 ## Docker build gotcha (fixed, kept here as a note)
 
 Both `server/` and `client/` need a `.dockerignore` excluding `node_modules` — without it,
