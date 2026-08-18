@@ -41,4 +41,97 @@ jobs:
         working-directory: client
         run: npm run lint
 
-  # Test job intentionally omitted — added from Phase 1 onward once tests exist.
+  # server/'s own unit + integration suite (npm test) is intentionally still
+  # not run here — that's Phase 15's job (CI/CD Pipeline). This e2e job is a
+  # deliberate, explicit exception added by Phase 9 specifically to prove
+  # the product's core convergence claim in CI, not a general "tests in CI"
+  # rollout ahead of schedule.
+  e2e:
+    name: E2E (Playwright — collaborative editing convergence)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: collab_editor
+          POSTGRES_PASSWORD: collab_editor_ci_password
+          POSTGRES_DB: collab_editor
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql://collab_editor:collab_editor_ci_password@localhost:5432/collab_editor
+      CORS_ORIGIN: http://localhost:5173
+      JWT_ACCESS_SECRET: ci_access_secret_not_for_production_use
+      JWT_REFRESH_SECRET: ci_refresh_secret_not_for_production_use
+      PORT: 4000
+      VITE_API_URL: http://localhost:4000
+      VITE_WS_URL: ws://localhost:4000
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: server/package-lock.json
+
+      - name: Install server dependencies
+        working-directory: server
+        run: npm install
+
+      - name: Run migrations
+        working-directory: server
+        run: npm run migrate
+
+      - name: Start server
+        working-directory: server
+        run: nohup npm start > server.log 2>&1 &
+
+      - name: Wait for server
+        run: timeout 30 bash -c 'until curl -sf http://localhost:4000/healthz; do sleep 1; done'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: client/package-lock.json
+
+      - name: Install client dependencies
+        working-directory: client
+        run: npm install
+
+      - name: Install Playwright browsers
+        working-directory: client
+        run: npx playwright install --with-deps chromium
+
+      - name: Start client dev server
+        working-directory: client
+        run: nohup npm run dev > client.log 2>&1 &
+
+      - name: Wait for client
+        run: timeout 30 bash -c 'until curl -sf http://localhost:5173; do sleep 1; done'
+
+      - name: Run Playwright E2E suite
+        working-directory: client
+        run: npm run test:e2e
+
+      - name: Upload server log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-log
+          path: server/server.log
+          retention-days: 7
+
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: client/playwright-report/
+          retention-days: 7

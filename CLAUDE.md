@@ -134,8 +134,11 @@ server/
                               accepted+broadcast, viewer sync-update rejected (and
                               positively confirmed NOT broadcast, via a race against a
                               timeout), invalid JWT rejected + socket closed, no-grant
-                              stranger rejected at join, and a late joiner receiving the
-                              room's already-edited in-memory state via loadDocumentState.
+                              stranger rejected at join, a late joiner receiving the room's
+                              already-edited in-memory state via loadDocumentState, and (as
+                              of Phase 9) 3 real concurrent clients making genuinely
+                              overlapping same-position edits, converging to an identical
+                              server-side result across 3 distinct delivery orderings
     db/             — repo-layer tests, one file per repo module, run against a real
                       disposable Postgres database (server/tests/db/helpers.js has the
                       shared TRUNCATE/fixture helpers)
@@ -169,6 +172,21 @@ client/
     pages/
       LoginPage.jsx, RegisterPage.jsx, DashboardPage.jsx, DocumentEditorPage.jsx
     App.jsx  — react-router-dom routes; main.jsx is the entrypoint (unchanged since Phase 0)
+  tests/e2e/
+    collaborativeEdit.spec.js — Playwright: 3 real browser contexts (3 real accounts),
+                              typing simultaneously at the same position, asserting all
+                              three converge to byte-identical, character-complete content.
+                              The single most directly convincing proof in the project. Run
+                              via `npm run test:e2e`; wired into CI's `e2e` job (Phase 9).
+  playwright.config.js — points at tests/e2e/, expects the full stack already running
+                              (locally via docker compose, in CI via the e2e job's own steps)
+docs/
+  manual-demo-script.md      — numbered live-demo script: 3-way simultaneous typing, then an
+                              offline-edit-and-reconnect walkthrough, written to be followed
+                              live without improvising
+  crdt-convergence-explained.md — plain-language "explain it in an interview with no notes"
+                              writeup of why CRDT convergence works; not a restatement of
+                              code comments
 PRD.md
 TECHNICAL_DESIGN.md   — partially populated (Section 4 "Backend Module Design" only so far)
 ROADMAP.md
@@ -461,7 +479,7 @@ docker-compose.yml
   succeeded cleanly with an empty room, no crash, `/healthz` fully green afterward. Server logs
   independently confirmed the 5s grace-period cleanup firing correctly in the live container.
 
-**Phase 8 — Frontend Real-Time Editor Integration: ✅ Done**
+**Phase 8 — Frontend Real-Time Editor Integration: ✅ Done (merged to main)**
 
 - `useYjsConnection.js` — owns a `Y.Doc` (recreated via `useMemo` keyed on `documentId`, so
   switching documents gets a fresh doc rather than reusing stale content) and its WebSocket
@@ -520,7 +538,54 @@ docker-compose.yml
   in this phase's prompt but still were never pasted into the file — proceeded anyway since the
   prompt itself specified exact backoff timing and hook responsibilities.
 
-**Next: Phase 9 — Multi-Client Convergence Validation & Proof**
+**Phase 9 — Multi-Client Convergence Validation & Proof: ✅ Done**
 
-Branch in progress: `phase-8-frontend-realtime` (not yet merged — pending user verification and
+This phase added no product features — its only job was rigorous, automated, demoable proof of
+the core convergence claim.
+
+- Expanded `multiClientSync.test.js` with a real 3-client convergence proof: three genuinely
+  concurrent, same-position edits (not just non-overlapping ones — the harder, more meaningful
+  case for the CRDT's tie-breaking), applied to three *fresh* documents in three different
+  delivery orders (a racing "simultaneous" order, and two explicit strict orders each confirmed
+  via broadcast round-trips rather than timing guesses), read back through a 4th observer
+  client's `sync-step` — same mechanism the existing "late joiner" test already used, so this
+  needed zero new server code. All three orderings assert byte-identical final content, plus a
+  length check proving no character was dropped or duplicated. 80 tests total (1 new, but it's
+  the load-bearing one).
+- `client/tests/e2e/collaborativeEdit.spec.js` — real Playwright, 3 real browser contexts, 3 real
+  registered accounts, typing **at the same position at the same time**, polling for convergence
+  rather than a fixed sleep, then asserting all three DOMs are byte-identical *and* that all 30
+  characters (10 of each user's marker) are present exactly once. Added `@playwright/test` as a
+  real `client/` devDependency (previously I'd only ever used a scratchpad-only Playwright install
+  for my own manual verification in Phases 5/8 — this is the first phase that asks for a
+  committed, CI-wired E2E suite).
+- **Flagged rather than silently patched, per this phase's explicit instruction**: writing the
+  E2E spec's permission-grant step hit the known Phase-5-flagged limitation again —
+  `PermissionsPanel` shows each grant's raw `userId`, not the granted email — which broke my
+  first attempt at asserting the grant succeeded. Did not touch the product to fix this; adjusted
+  the *test's* assertion to check the permission list's item count instead. Still on the table if
+  you want it fixed.
+- CI: added a new `e2e` job to `.github/workflows/ci.yml` (Postgres service container, migrate,
+  start server, start client dev server, install Playwright browsers, run the suite, upload the
+  HTML report + server log as artifacts on failure) — a deliberate, explicit exception pulling
+  E2E-in-CI forward from Phase 15's broader "wire up all the tests" scope, not a general rollout.
+  **Important limitation**: I validated the YAML syntax and every individual command locally, but
+  I cannot trigger or observe an actual GitHub Actions run myself — that requires pushing, which
+  is your job per our standing workflow. Please confirm the `e2e` job actually goes green after
+  you push, rather than assuming my local verification covers it.
+- `docs/manual-demo-script.md` — numbered, narratable live-demo script: 3-way simultaneous
+  overlapping typing, then a full offline-edit → reconnect → reconciliation walkthrough, plus a
+  troubleshooting section for if something misbehaves live.
+- `docs/crdt-convergence-explained.md` — plain-language explanation written for "explain this in
+  an interview with no notes," not a restatement of code comments. Covers: why locking/last-
+  write-wins fail, the two properties (unique IDs, neighbor-anchoring not position-anchoring)
+  that make operations order-independent, the deterministic tie-break for same-position
+  concurrent inserts, a worked two-user example, the honest caveat (convergence ≠ semantic
+  merge quality), and the "why Yjs over OT" framing from PRD Section 24's interview guidance.
+- Verified locally: full backend suite (80/80), the E2E spec run **4 consecutive times** with no
+  flakes (~20–30s each), lint clean on both packages, production build clean.
+
+**Next: Phase 10 — Presence & Live Cursors**
+
+Branch in progress: `phase-9-convergence-proof` (not yet merged — pending user verification and
 commit).

@@ -24,5 +24,11 @@
     "react/prop-types": "off",
     "react-refresh/only-export-components": ["warn", { "allowConstantExport": true }],
     "no-unused-vars": ["warn", { "argsIgnorePattern": "^_" }]
-  }
+  },
+  "overrides": [
+    {
+      "files": ["playwright.config.js", "tests/e2e/**/*.js"],
+      "env": { "browser": false, "node": true }
+    }
+  ]
 }
