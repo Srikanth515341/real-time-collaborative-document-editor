@@ -73,7 +73,7 @@ export default function PermissionsPanel({ documentId, isOwner }) {
         <ul className="permission-list">
           {grants.map((grant) => (
             <li key={grant.id}>
-              <span className="permission-user">{grant.userId}</span>
+              <span className="permission-user">{grant.email}</span>
               <span className="permission-role">{grant.role}</span>
               {grant.role !== 'owner' && (
                 <button type="button" className="secondary" onClick={() => handleRevoke(grant.userId)}>
