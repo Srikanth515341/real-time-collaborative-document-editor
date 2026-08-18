@@ -130,15 +130,53 @@ curl -X POST http://localhost:4000/api/documents \
 ## Frontend
 
 React + react-router-dom. Register/log in at `/login` and `/register`, then the dashboard (`/`)
-lists your documents and lets you create one; opening a document (`/documents/:id`) shows its
-metadata, a placeholder where the real-time editor lands in Phase 8, and — for the document's
-owner — an access panel to grant/revoke `editor`/`viewer` roles by email.
+lists your documents and lets you create one; opening a document (`/documents/:id`) connects to
+the live CRDT sync engine and shows a real, working collaborative plain-text editor, plus — for
+the document's owner — an access panel to grant/revoke `editor`/`viewer` roles by email.
 
 **Token storage**: the access token lives in memory only (never in `localStorage`/
 `sessionStorage`); the refresh token (plus a small cached display profile) lives in
 `sessionStorage`, so a page reload doesn't force a re-login but a closed tab doesn't leave a
 lingering credential. This is a deliberate tradeoff, not a default — see `CLAUDE.md`'s Phase 5
 notes for the full reasoning and what a stronger (httpOnly-cookie) version would need.
+
+## Real-time collaborative editing — manual verification
+
+As of Phase 8, opening a document at `http://localhost:5173/documents/:id` connects to the real
+WebSocket sync engine and gives you a working `contenteditable` text area, bound live to the
+document's shared `Y.Text` via `useYjsConnection` + `EditorSurface`. A connection-status badge in
+the header always shows the true state: **Connecting…** / **Connected** / **Reconnecting…** /
+**Connection lost**.
+
+**Two-tab live sync:**
+1. Register two accounts (or one account, two tabs — sync doesn't care about tab identity, only
+   the WebSocket connection).
+2. Grant the second account at least `editor` access via the Access panel.
+3. Open the same document in two browser tabs (each logged in as a different account, or the same
+   one — both work).
+4. Confirm both tabs show a **Connected** badge.
+5. Type in tab A — it should appear in tab B within a fraction of a second, and vice versa.
+6. Both tabs should always show byte-identical content once typing settles.
+
+**Simultaneous overlapping typing** (the core proof point): have both tabs type into the editor
+*at the same time*, ideally at overlapping positions. Both tabs should converge to the exact same
+final text, with **no characters lost from either side** — this is Yjs's CRDT convergence
+guarantee (proved in isolation by `crdtMerge.test.js`) now working end-to-end through the real
+UI, not just in a unit test.
+
+**Reconnect after a network drop:**
+1. With a document open and `Connected`, cut your network (disable Wi-Fi, or use your browser
+   devtools' network throttling → Offline).
+2. The badge should transition to **Reconnecting…** within a few seconds.
+3. Keep typing — your keystrokes should still apply locally (the editor doesn't lock up), even
+   though nothing is syncing yet.
+4. Restore your network. The badge should return to **Connected**, and everything you typed while
+   offline should now appear for other collaborators too — `useYjsConnection` resends its full
+   local state on every successful (re)join, which is what gets those offline edits to the server
+   once you're back (see `CLAUDE.md`'s Phase 8 notes for why this is safe/idempotent).
+5. If you stay offline long enough (backoff caps at 10s between attempts, gives up after 8), the
+   badge settles on **Connection lost** — full persistence-across-a-reload recovery for that case
+   is Phase 12's job, not this phase's.
 
 ## CRDT sync engine (WebSocket) — manual verification
 

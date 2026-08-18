@@ -157,9 +157,15 @@ client/
     hooks/
       useAuth.js       — AuthProvider + useAuth(); kept as plain .js (uses createElement,
                         not JSX syntax, since Vite only JSX-transforms .jsx by default)
+      useYjsConnection.js — owns a Y.Doc + its WebSocket connection for one document;
+                        exposes { yDoc, connectionStatus, canEdit, error }. See "Phase 8"
+                        below for the origin-check/echo-loop and reconnect-backoff design.
     components/
       ProtectedRoute.jsx  — redirects to /login if not authenticated
       PermissionsPanel.jsx — owner-only; list/grant/revoke access
+      EditorSurface.jsx    — plain contenteditable div bound to yDoc.getText('content');
+                        diffs DOM input against the Y.Text via a common-prefix/suffix
+                        range, no rich text/formatting
     pages/
       LoginPage.jsx, RegisterPage.jsx, DashboardPage.jsx, DocumentEditorPage.jsx
     App.jsx  — react-router-dom routes; main.jsx is the entrypoint (unchanged since Phase 0)
@@ -412,7 +418,7 @@ docker-compose.yml
   (react-router-dom) — this time with `yjs`. Documented it properly in the README this time
   (`--force-recreate --renew-anon-volumes`) instead of just fixing it silently again.
 
-**Phase 7 — WebSocket Gateway — Production Integration: ✅ Done**
+**Phase 7 — WebSocket Gateway — Production Integration: ✅ Done (merged to main)**
 
 - `joinDocument.js` now requires a real JWT (`jwt.js`'s `verify()`, same as REST's
   `authenticate.js`) and at least `viewer` access (`documentService.ensureUserCanAccess`, the
@@ -455,7 +461,66 @@ docker-compose.yml
   succeeded cleanly with an empty room, no crash, `/healthz` fully green afterward. Server logs
   independently confirmed the 5s grace-period cleanup firing correctly in the live container.
 
-**Next: Phase 8 — Frontend Real-Time Editor Integration**
+**Phase 8 — Frontend Real-Time Editor Integration: ✅ Done**
 
-Branch in progress: `phase-7-websocket-production` (not yet merged — pending user verification
-and commit).
+- `useYjsConnection.js` — owns a `Y.Doc` (recreated via `useMemo` keyed on `documentId`, so
+  switching documents gets a fresh doc rather than reusing stale content) and its WebSocket
+  lifecycle. The **echo-loop check**: every server-applied update is tagged with a
+  `SERVER_ORIGIN` sentinel via `Y.applyUpdate(yDoc, update, SERVER_ORIGIN)`; the `yDoc.on('update')`
+  listener that relays local edits to the server skips anything tagged with that origin. A plain
+  local `Y.Text` edit's origin is Yjs's default (not the sentinel), so it's the only thing that
+  ever gets sent — without this, receiving an update would immediately re-broadcast it back to
+  the server, which would rebroadcast it to us again, forever.
+- Reconnect state machine exactly as specified: 500ms initial backoff, doubling, capped at 10s,
+  gives up after 8 attempts (`connectionStatus` becomes `'disconnected'`). A `PERMISSION_DENIED`/
+  `UNAUTHORIZED` error at join time also goes straight to `'disconnected'` without burning
+  through retries, since retrying can't fix a permission problem — but the *same* error code
+  arriving on a `sync-update` *after* already being connected (e.g. role downgraded mid-session)
+  only flips `canEdit` false, since the connection itself is still fine.
+- **Deliberate addition beyond the literal spec, to make "reconnect after a network drop" actually
+  work**: on every successful `sync-step` (including reconnects), the hook resends its own full
+  current state (`Y.encodeStateAsUpdate(yDoc)`) to the server. Yjs updates are idempotent, so this
+  is a safe no-op for anything the server already has, and is what actually gets edits made
+  *during* a disconnect to the server once back online — without it, those edits would stay
+  correctly visible locally (Yjs never loses anything) but would never reach anyone else, since
+  Yjs only fires `'update'` for new changes, not ones that already happened while offline. This
+  only uses what's already in the in-memory `Y.Doc` — no new persistence layer, so it doesn't
+  cross into Phase 12's territory.
+- `EditorSurface.jsx` — plain contenteditable div, common-prefix/suffix diffing (not a general
+  diff algorithm — unnecessary for single-keystroke/paste-sized changes), caret-position
+  preservation across remote-triggered re-renders via the Range/Selection API.
+- **Found and fixed a real contenteditable bug via live browser testing**: Chromium leaves a
+  stray `<br>` after a user clears all content (select-all + backspace), which `innerText`
+  reports as `"\n"`, not `""` — silently corrupting the synced document with a phantom newline
+  on every full clear. Fixed with a `getPlainText()` helper that treats a `textContent`-empty div
+  as truly empty regardless of what `innerText` says (a `<br>` contributes nothing to
+  `textContent`), while still using `innerText` for the non-empty case since it's what correctly
+  serializes multi-line content into real `\n` characters.
+- **Found and fixed a real design bug via live browser testing**: `DocumentEditorPage` originally
+  disabled the editor whenever `connectionStatus !== 'connected'`, which made it *impossible* to
+  type while `'reconnecting'` — directly defeating the hook's own offline-resilience design
+  (local edits are supposed to stay usable during a brief drop). Fixed so editing is only
+  disabled on a truly given-up `'disconnected'` state or `canEdit === false`.
+- Connection-status badge (`Connecting…` / `Connected` / `Reconnecting…` / `Connection lost`) in
+  `DocumentEditorPage`'s header, plus a "You have view-only access" notice when `canEdit` is
+  false — never leaves the user silently guessing.
+- Known, deliberately-flagged limitation: an access token that expires mid-session (15 min) while
+  the WebSocket stays open has no automatic refresh path here — `httpClient.js`'s silent-refresh
+  only triggers on a REST 401, not from `useYjsConnection`. A page reload/renavigation picks up a
+  fresh token via the existing session-restore flow. Deliberately not fixed now — felt like
+  Phase 12 territory (or a targeted follow-up) rather than something to silently bolt on.
+- Verified live in a real browser (Playwright), not just lint/build: two independent logged-in
+  tabs both showing `Connected`, A's typing appearing in B and vice versa, both tabs converging to
+  byte-identical content, **simultaneous overlapping typing from both tabs at once converging to
+  an identical, character-complete result with zero data loss** (the PRD's own headline proof
+  point), and a full network-drop/reconnect cycle — status badge correctly reflecting the drop,
+  local typing while offline, automatic reconnect, and the offline-typed content actually
+  reaching a separate collaborator's browser once back online.
+- `TECHNICAL_DESIGN.md` Sections 5 (reconnect state machine) and 6 (hook design) were referenced
+  in this phase's prompt but still were never pasted into the file — proceeded anyway since the
+  prompt itself specified exact backoff timing and hook responsibilities.
+
+**Next: Phase 9 — Multi-Client Convergence Validation & Proof**
+
+Branch in progress: `phase-8-frontend-realtime` (not yet merged — pending user verification and
+commit).
