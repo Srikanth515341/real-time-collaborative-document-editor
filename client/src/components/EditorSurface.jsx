@@ -1,12 +1,18 @@
-import { useCallback, useEffect, useMemo, useRef } from 'react';
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef } from 'react';
 
 // A plain-text contenteditable div bound to a Y.Text. Deliberately no rich
 // formatting and no editing framework -- the goal for this phase is a
 // correct, working plain-text sync engine, not a polished editor (that's a
 // later concern, if ever).
-export default function EditorSurface({ yDoc, disabled }) {
+//
+// Forwards its DOM node so RemoteCursors (Phase 10) can measure caret
+// positions against the exact same element this component renders text
+// into -- the two need to agree on the same flat-text-node DOM shape
+// described in the getCaretOffset/setCaretOffset comments below.
+const EditorSurface = forwardRef(function EditorSurface({ yDoc, disabled, onAwarenessChange }, forwardedRef) {
   const ytext = useMemo(() => yDoc.getText('content'), [yDoc]);
   const divRef = useRef(null);
+  useImperativeHandle(forwardedRef, () => divRef.current, []);
 
   // Re-renders the div's text from ytext, preserving the caret position if
   // the div is currently focused. Called both on mount and whenever ytext
@@ -35,6 +41,27 @@ export default function EditorSurface({ yDoc, disabled }) {
     return () => ytext.unobserve(renderFromYText);
   }, [ytext, renderFromYText]);
 
+  // Reports the local caret/selection to the parent (which forwards it to
+  // useYjsConnection's throttled sendAwareness) whenever it changes --
+  // typing, clicking, arrow keys, drag-selecting. `selectionchange` is a
+  // document-wide event (not scoped to this element), so it's filtered down
+  // to "is this editor actually focused right now".
+  const reportSelection = useCallback(() => {
+    const div = divRef.current;
+    if (!div || !onAwarenessChange || document.activeElement !== div) return;
+    const range = getSelectionRange(div);
+    if (!range) return;
+    onAwarenessChange({
+      cursor: range.end,
+      selection: range.start === range.end ? null : [range.start, range.end],
+    });
+  }, [onAwarenessChange]);
+
+  useEffect(() => {
+    document.addEventListener('selectionchange', reportSelection);
+    return () => document.removeEventListener('selectionchange', reportSelection);
+  }, [reportSelection]);
+
   // Translates a DOM input event into the minimal Y.Text insert/delete pair
   // needed to reconcile the old content with the new. A single keystroke or
   // paste almost always changes one contiguous region, so a common-prefix /
@@ -59,7 +86,8 @@ export default function EditorSurface({ yDoc, disabled }) {
         ytext.insert(start, newText.slice(start, newEnd));
       }
     });
-  }, [ytext, yDoc]);
+    reportSelection();
+  }, [ytext, yDoc, reportSelection]);
 
   return (
     <div
@@ -68,13 +96,16 @@ export default function EditorSurface({ yDoc, disabled }) {
       contentEditable={!disabled}
       suppressContentEditableWarning
       onInput={handleInput}
+      onFocus={reportSelection}
       role="textbox"
       aria-multiline="true"
       aria-label="Document content"
       aria-readonly={disabled}
     />
   );
-}
+});
+
+export default EditorSurface;
 
 // A contenteditable div that's been fully cleared by the user (select-all +
 // delete/backspace) is left by the browser holding a single stray <br> to
@@ -136,4 +167,23 @@ function setCaretOffset(container, offset) {
   range.collapse(true);
   selection.removeAllRanges();
   selection.addRange(range);
+}
+
+// Like getCaretOffset, but returns both ends of the current selection (equal
+// if it's just a collapsed caret) for reporting to awareness. Same flat
+// single-text-node assumption as everything else in this file: since
+// startContainer/endContainer can only be the div itself (offset 0, an empty
+// document) or its lone text node (offset == character offset directly),
+// there's no need for the prefix-string-length trick getCaretOffset uses.
+function getSelectionRange(container) {
+  const selection = window.getSelection();
+  if (!selection || selection.rangeCount === 0) return null;
+  const range = selection.getRangeAt(0);
+  if (!container.contains(range.startContainer) || !container.contains(range.endContainer)) {
+    return null;
+  }
+  const offsetOf = (node, offset) => (node === container ? 0 : offset);
+  const start = offsetOf(range.startContainer, range.startOffset);
+  const end = offsetOf(range.endContainer, range.endOffset);
+  return { start: Math.min(start, end), end: Math.max(start, end) };
 }

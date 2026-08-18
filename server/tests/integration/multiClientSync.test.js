@@ -6,6 +6,7 @@ import * as Y from 'yjs';
 import { pool } from '../../src/db/pool.js';
 import { createApp } from '../../src/app.js';
 import { attachWebSocketServer } from '../../src/websocket/wsServer.js';
+import { getColorForUser } from '../../src/utils/presenceColor.js';
 import { resetTables } from '../db/helpers.js';
 
 // Exercises the real, production-wired WebSocket gateway: real HTTP server +
@@ -79,6 +80,29 @@ function nextMessage(ws) {
   });
 }
 
+// Like nextMessage, but for reading MULTIPLE messages off the same socket
+// back-to-back (e.g. join-document's sync-step immediately followed by a
+// user-joined). ws can synchronously deliver several already-buffered
+// frames from one 'data' event before yielding back to the microtask queue
+// -- two sequential `await nextMessage(ws)` calls would race in that case,
+// since the second `.once` attaches only after the second message already
+// fired (and was dropped, having no listener). Attaching one persistent
+// `.on` listener BEFORE anything is sent avoids that entirely: it can never
+// miss a message no matter how many arrive in the same synchronous burst.
+function collectMessages(ws, count) {
+  return new Promise((resolve) => {
+    const collected = [];
+    function onMessage(raw) {
+      collected.push(JSON.parse(raw.toString()));
+      if (collected.length === count) {
+        ws.off('message', onMessage);
+        resolve(collected);
+      }
+    }
+    ws.on('message', onMessage);
+  });
+}
+
 function send(ws, msg) {
   ws.send(JSON.stringify(msg));
 }
@@ -102,6 +126,11 @@ test("an editor's sync-update is accepted and broadcast to other clients in the 
   const editorWs = await connectWs();
   send(editorWs, { type: 'join-document', documentId: doc.id, token: editor.accessToken });
   assert.equal((await nextMessage(editorWs)).type, 'sync-step');
+
+  // The editor joining also earns the owner a `user-joined` broadcast
+  // (Phase 10) -- drain it before listening for the sync-update broadcast
+  // below, so the two don't race against each other on the owner's socket.
+  assert.equal((await nextMessage(ownerWs)).type, 'user-joined');
 
   const ownerReceivedPromise = nextMessage(ownerWs);
   const update = makeYUpdate('hello from editor');
@@ -129,6 +158,11 @@ test("a viewer's sync-update is rejected with PERMISSION_DENIED and never applie
   const viewerWs = await connectWs();
   send(viewerWs, { type: 'join-document', documentId: doc.id, token: viewer.accessToken });
   await nextMessage(viewerWs);
+
+  // Same Phase 10 drain as the editor test above -- the viewer joining
+  // earns the owner a `user-joined` broadcast that must be consumed before
+  // the silence check below, or the two race.
+  await nextMessage(ownerWs);
 
   // Race a "did the owner get anything?" listener against a short timeout,
   // set up BEFORE sending, so we can positively assert nothing was
@@ -416,4 +450,186 @@ test('3 concurrent clients editing the same document converge to an identical re
   assert.ok(resultSimultaneous.includes('[Bob]'), "Bob's edit is present");
   assert.ok(resultSimultaneous.includes('[Carol]'), "Carol's edit is present");
   assert.equal(resultSimultaneous.length, '[Alice]'.length + '[Bob]'.length + '[Carol]'.length);
+});
+
+// ---------------------------------------------------------------------------
+// Phase 10: presence & live cursors. Awareness data (cursor/selection) is
+// ephemeral and purely broadcast (PRD.md Section 11) -- these tests prove
+// the join/leave lifecycle events and the awareness relay itself, all
+// against the same real HTTP+WS server + real JWTs + real permission grants
+// as everything above.
+// ---------------------------------------------------------------------------
+
+test('a joining client is announced to existing occupants via user-joined, and itself learns about everyone already present', async () => {
+  const owner = await registerUser('Owner');
+  const editor = await registerUser('Editor');
+  const doc = await createDocument(owner.accessToken);
+  await grantPermission(owner.accessToken, doc.id, editor.email, 'editor');
+
+  const ownerWs = await connectWs();
+  send(ownerWs, { type: 'join-document', documentId: doc.id, token: owner.accessToken });
+  // Alone in a fresh room -- nobody to be told about, so just the sync-step.
+  assert.equal((await nextMessage(ownerWs)).type, 'sync-step');
+
+  const ownerNotifiedPromise = nextMessage(ownerWs);
+
+  const editorWs = await connectWs();
+  // Attached BEFORE sending join-document -- see collectMessages' own
+  // comment: the sync-step and the user-joined-about-owner that follow it
+  // can arrive in the same synchronous burst, so this must be listening
+  // before either is sent, not read one-at-a-time after the fact.
+  const editorMessagesPromise = collectMessages(editorWs, 2);
+  send(editorWs, { type: 'join-document', documentId: doc.id, token: editor.accessToken });
+
+  // The editor's OWN socket always gets its sync-step first (see
+  // joinDocument.js's comment on why), THEN hears about the owner, who was
+  // already there.
+  const [editorSyncStep, editorHearsAboutOwner] = await editorMessagesPromise;
+  assert.equal(editorSyncStep.type, 'sync-step');
+  assert.equal(editorHearsAboutOwner.type, 'user-joined');
+  assert.equal(editorHearsAboutOwner.user.id, owner.id);
+  assert.equal(editorHearsAboutOwner.user.displayName, owner.displayName);
+  assert.equal(editorHearsAboutOwner.user.color, getColorForUser(owner.id));
+
+  // The OWNER's socket is separately told about the editor joining.
+  const ownerNotified = await ownerNotifiedPromise;
+  assert.equal(ownerNotified.type, 'user-joined');
+  assert.equal(ownerNotified.user.id, editor.id);
+  assert.equal(ownerNotified.user.displayName, editor.displayName);
+  assert.equal(ownerNotified.user.color, getColorForUser(editor.id));
+
+  ownerWs.close();
+  editorWs.close();
+});
+
+test('the same user always gets the same presence color across separate joins', async () => {
+  const owner = await registerUser('Owner');
+  const editor = await registerUser('Editor');
+  const doc = await createDocument(owner.accessToken);
+  await grantPermission(owner.accessToken, doc.id, editor.email, 'editor');
+
+  const ownerWs = await connectWs();
+  send(ownerWs, { type: 'join-document', documentId: doc.id, token: owner.accessToken });
+  await nextMessage(ownerWs); // sync-step
+
+  const firstNotifiedPromise = nextMessage(ownerWs);
+  const editorWsFirst = await connectWs();
+  send(editorWsFirst, { type: 'join-document', documentId: doc.id, token: editor.accessToken });
+  const firstJoin = await firstNotifiedPromise;
+  editorWsFirst.close();
+
+  // Give the leave its grace-period-independent effect a moment, then have
+  // the SAME editor reconnect as a brand new socket.
+  await nextMessage(ownerWs); // user-left for the first editor socket
+
+  const secondNotifiedPromise = nextMessage(ownerWs);
+  const editorWsSecond = await connectWs();
+  send(editorWsSecond, { type: 'join-document', documentId: doc.id, token: editor.accessToken });
+  const secondJoin = await secondNotifiedPromise;
+
+  assert.equal(firstJoin.user.color, secondJoin.user.color);
+  assert.equal(firstJoin.user.color, getColorForUser(editor.id));
+
+  ownerWs.close();
+  editorWsSecond.close();
+});
+
+test('leaving a document (explicit leave-document) announces user-left to remaining clients', async () => {
+  const owner = await registerUser('Owner');
+  const editor = await registerUser('Editor');
+  const doc = await createDocument(owner.accessToken);
+  await grantPermission(owner.accessToken, doc.id, editor.email, 'editor');
+
+  const ownerWs = await connectWs();
+  send(ownerWs, { type: 'join-document', documentId: doc.id, token: owner.accessToken });
+  await nextMessage(ownerWs); // sync-step
+
+  const editorWs = await connectWs();
+  const editorMessagesPromise = collectMessages(editorWs, 2); // sync-step, then user-joined (about owner)
+  send(editorWs, { type: 'join-document', documentId: doc.id, token: editor.accessToken });
+  await editorMessagesPromise;
+
+  await nextMessage(ownerWs); // user-joined (about editor) -- drain it
+
+  const ownerHearsLeavePromise = nextMessage(ownerWs);
+  send(editorWs, { type: 'leave-document', documentId: doc.id });
+  const ownerHearsLeave = await ownerHearsLeavePromise;
+
+  assert.equal(ownerHearsLeave.type, 'user-left');
+  assert.equal(ownerHearsLeave.userId, editor.id);
+
+  ownerWs.close();
+  editorWs.close();
+});
+
+test('an awareness-update is broadcast to other clients with the sender\'s userId and color, and never echoed back to the sender', async () => {
+  const owner = await registerUser('Owner');
+  const editor = await registerUser('Editor');
+  const doc = await createDocument(owner.accessToken);
+  await grantPermission(owner.accessToken, doc.id, editor.email, 'editor');
+
+  const ownerWs = await connectWs();
+  send(ownerWs, { type: 'join-document', documentId: doc.id, token: owner.accessToken });
+  await nextMessage(ownerWs); // sync-step
+
+  const editorWs = await connectWs();
+  const editorMessagesPromise = collectMessages(editorWs, 2); // sync-step, then user-joined (about owner)
+  send(editorWs, { type: 'join-document', documentId: doc.id, token: editor.accessToken });
+  await editorMessagesPromise;
+  await nextMessage(ownerWs); // user-joined (about editor) -- drain it
+
+  // Positively confirm the sender never receives its own broadcast back,
+  // racing against a short timeout, the same pattern the viewer-rejection
+  // test above uses.
+  const editorSilenceCheck = Promise.race([
+    nextMessage(editorWs).then(() => 'unexpected-message-received'),
+    new Promise((resolve) => setTimeout(() => resolve('silence-as-expected'), 500)),
+  ]);
+  const ownerReceivedPromise = nextMessage(ownerWs);
+
+  send(editorWs, {
+    type: 'awareness-update',
+    documentId: doc.id,
+    awareness: { cursor: 12, selection: [10, 14] },
+  });
+
+  const ownerReceived = await ownerReceivedPromise;
+  assert.equal(ownerReceived.type, 'awareness-update');
+  assert.equal(ownerReceived.userId, editor.id);
+  assert.equal(ownerReceived.awareness.cursor, 12);
+  assert.deepEqual(ownerReceived.awareness.selection, [10, 14]);
+  assert.equal(ownerReceived.awareness.color, getColorForUser(editor.id));
+
+  assert.equal(await editorSilenceCheck, 'silence-as-expected');
+
+  ownerWs.close();
+  editorWs.close();
+});
+
+test('a viewer can also send awareness-update (presence is not editor-only)', async () => {
+  const owner = await registerUser('Owner');
+  const viewer = await registerUser('Viewer');
+  const doc = await createDocument(owner.accessToken);
+  await grantPermission(owner.accessToken, doc.id, viewer.email, 'viewer');
+
+  const ownerWs = await connectWs();
+  send(ownerWs, { type: 'join-document', documentId: doc.id, token: owner.accessToken });
+  await nextMessage(ownerWs); // sync-step
+
+  const viewerWs = await connectWs();
+  const viewerMessagesPromise = collectMessages(viewerWs, 2); // sync-step, then user-joined (about owner)
+  send(viewerWs, { type: 'join-document', documentId: doc.id, token: viewer.accessToken });
+  await viewerMessagesPromise;
+  await nextMessage(ownerWs); // user-joined (about viewer) -- drain it
+
+  const ownerReceivedPromise = nextMessage(ownerWs);
+  send(viewerWs, { type: 'awareness-update', documentId: doc.id, awareness: { cursor: 3 } });
+  const ownerReceived = await ownerReceivedPromise;
+
+  assert.equal(ownerReceived.type, 'awareness-update');
+  assert.equal(ownerReceived.userId, viewer.id);
+  assert.equal(ownerReceived.awareness.cursor, 3);
+
+  ownerWs.close();
+  viewerWs.close();
 });

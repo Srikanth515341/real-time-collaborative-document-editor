@@ -51,8 +51,11 @@ async function createRoom(documentId) {
   return room;
 }
 
-// Registers a connected client (a ws connection) in the room. Cancels any
-// pending empty-room cleanup, since the room is no longer empty.
+// Registers a connected client (a ws connection) in the room. `user` is
+// { userId, displayName, color } -- the same shape broadcast in user-joined
+// / user-left messages, so removeClientFromRoom below can announce a leave
+// without needing any extra lookup. Cancels any pending empty-room cleanup,
+// since the room is no longer empty.
 export function addClientToRoom(room, client, user) {
   clearPendingCleanup(room.documentId);
   room.clients.set(client, user);
@@ -62,10 +65,14 @@ export function addClientToRoom(room, client, user) {
   );
 }
 
-// Removes a client from the room. If the room is now empty, it isn't torn
-// down immediately -- a short grace period lets the same user reconnect
-// (e.g. a brief network blip, or navigating between documents) without
-// forcing a full reload of the room's state.
+// Removes a client from the room and announces the departure to whoever's
+// left (PRD.md Section 10.5's `user-left`) so this fires exactly once no
+// matter which of the two paths that can trigger a leave -- the explicit
+// leave-document message, or the ws 'close' event -- called it, instead of
+// duplicating the broadcast at both call sites. If the room is now empty,
+// it isn't torn down immediately -- a short grace period lets the same user
+// reconnect (e.g. a brief network blip, or navigating between documents)
+// without forcing a full reload of the room's state.
 export function removeClientFromRoom(room, client) {
   const user = room.clients.get(client);
   room.clients.delete(client);
@@ -73,6 +80,9 @@ export function removeClientFromRoom(room, client) {
     { documentId: room.documentId, userId: user?.userId, roomSize: room.clients.size },
     'client removed from room'
   );
+  if (user) {
+    broadcastToRoom(room, { type: 'user-left', documentId: room.documentId, userId: user.userId }, client);
+  }
   if (room.clients.size === 0) {
     scheduleRoomCleanup(room);
   }

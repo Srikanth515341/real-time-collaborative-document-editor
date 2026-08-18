@@ -1,8 +1,10 @@
 import * as Y from 'yjs';
-import { getOrCreateRoom, addClientToRoom } from '../roomManager.js';
+import { getOrCreateRoom, addClientToRoom, broadcastToRoom } from '../roomManager.js';
 import { logger } from '../../utils/logger.js';
 import { verify } from '../../utils/jwt.js';
 import { ensureUserCanAccess } from '../../services/documentService.js';
+import { findUserById } from '../../db/users.repo.js';
+import { getColorForUser } from '../../utils/presenceColor.js';
 
 function sendErrorAndClose(client, code, message, closeCode) {
   client.send(JSON.stringify({ type: 'error', code, message }));
@@ -51,14 +53,27 @@ export async function handleJoinDocument(client, message) {
   }
 
   const room = await getOrCreateRoom(documentId);
-  addClientToRoom(room, client, { userId });
+
+  // Snapshot of who's already here, taken BEFORE adding this client, so it
+  // can be handed to the new client without an awkward "skip myself" check.
+  const existingOccupants = Array.from(room.clients.values());
+
+  const userRecord = await findUserById(userId);
+  const displayName = userRecord?.displayName ?? decoded.email;
+  const color = getColorForUser(userId);
+
+  addClientToRoom(room, client, { userId, displayName, color });
   client.room = room;
   client.userId = userId;
   client.documentId = documentId;
+  client.color = color;
 
-  // Send the room's current authoritative state so a joining client starts
-  // from wherever the document currently is, per TECHNICAL_DESIGN.md
-  // Section 4 / PRD.md Section 11 step 2.
+  // Send the room's current authoritative state FIRST, before anything
+  // presence-related -- a joining client's own sync-step must always be the
+  // very first message it ever receives on this socket (existing tests and
+  // useYjsConnection's "the first sync-step means we're really connected"
+  // logic both depend on that), per TECHNICAL_DESIGN.md Section 4 / PRD.md
+  // Section 11 step 2.
   const stateUpdate = Y.encodeStateAsUpdate(room.yDoc);
   client.send(
     JSON.stringify({
@@ -66,6 +81,26 @@ export async function handleJoinDocument(client, message) {
       documentId,
       update: Buffer.from(stateUpdate).toString('base64'),
     })
+  );
+
+  // Tell the newly-joined client about everyone already present (PRD.md
+  // Section 10.5's `user-joined`), so its presence list is populated
+  // immediately instead of waiting on each occupant's next awareness ping.
+  for (const occupant of existingOccupants) {
+    client.send(
+      JSON.stringify({
+        type: 'user-joined',
+        documentId,
+        user: { id: occupant.userId, displayName: occupant.displayName, color: occupant.color },
+      })
+    );
+  }
+
+  // ...and tell everyone already here that this client just joined.
+  broadcastToRoom(
+    room,
+    { type: 'user-joined', documentId, user: { id: userId, displayName, color } },
+    client
   );
 
   logger.info({ documentId, userId }, 'client joined document room');

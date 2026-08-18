@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import * as Y from 'yjs';
 import { getAccessToken } from '../api/httpClient.js';
 
@@ -19,8 +19,17 @@ const INITIAL_RECONNECT_DELAY_MS = 500;
 const MAX_RECONNECT_DELAY_MS = 10_000;
 const MAX_RECONNECT_ATTEMPTS = 8;
 
+// Caps outgoing awareness (cursor/selection) messages to at most one per
+// 100ms per client -- PRD.md Section 11's presence pings are meant to be
+// frequent enough to feel live, but a raw keyup/selectionchange listener can
+// fire far faster than that (every keystroke, every arrow key, every mouse
+// drag), so without this a fast typist would flood the room with dozens of
+// messages a second for no visible benefit.
+const AWARENESS_THROTTLE_MS = 100;
+
 // Owns a Y.Doc and its WebSocket connection to the sync gateway for one
-// document. Exposes { yDoc, connectionStatus, canEdit, error }.
+// document. Exposes { yDoc, connectionStatus, canEdit, error, participants,
+// sendAwareness }.
 export function useYjsConnection(documentId) {
   // documentId isn't used inside the factory, but it's the whole point of
   // the dependency: a new document needs a brand-new Y.Doc, not the
@@ -30,12 +39,29 @@ export function useYjsConnection(documentId) {
   const [connectionStatus, setConnectionStatus] = useState('connecting');
   const [canEdit, setCanEdit] = useState(true);
   const [error, setError] = useState(null);
+  // Other users currently in the room: userId -> { id, displayName, color,
+  // cursor, selection }. Populated entirely from user-joined / user-left /
+  // awareness-update broadcasts -- never persisted, never fetched via REST,
+  // exactly the ephemeral "who's where right now" model PRD.md Section 11
+  // describes. Reset on every fresh join (including reconnects), since a
+  // stale entry for someone who left while we were offline would otherwise
+  // linger forever with no user-left to clear it.
+  const [participants, setParticipants] = useState({});
 
   const wsRef = useRef(null);
   const connectionStatusRef = useRef('connecting'); // mirrors state for use inside WS callbacks
   const reconnectAttemptRef = useRef(0);
   const reconnectTimeoutRef = useRef(null);
   const intentionalCloseRef = useRef(false);
+
+  // Awareness throttle state -- see AWARENESS_THROTTLE_MS above. Leading +
+  // trailing: the first call in a quiet period sends immediately, rapid
+  // follow-up calls are coalesced into a single trailing send of the LATEST
+  // position once the throttle window elapses, so the final cursor position
+  // is never silently dropped.
+  const awarenessLastSentAtRef = useRef(0);
+  const awarenessPendingRef = useRef(null);
+  const awarenessTimeoutRef = useRef(null);
 
   useEffect(() => {
     intentionalCloseRef.current = false;
@@ -49,6 +75,11 @@ export function useYjsConnection(documentId) {
     function connect() {
       const ws = new WebSocket(WS_URL);
       wsRef.current = ws;
+      // A fresh join (first connect, or a reconnect after a drop) gets fresh
+      // user-joined broadcasts for whoever's currently in the room -- any
+      // stale entries from before are meaningless without that, since we
+      // have no way to know who left while we were disconnected.
+      setParticipants({});
 
       ws.addEventListener('open', () => {
         ws.send(
@@ -92,6 +123,39 @@ export function useYjsConnection(documentId) {
           return;
         }
 
+        if (message.type === 'user-joined') {
+          const { user } = message;
+          setParticipants((prev) => ({
+            ...prev,
+            [user.id]: { ...prev[user.id], id: user.id, displayName: user.displayName, color: user.color },
+          }));
+          return;
+        }
+
+        if (message.type === 'user-left') {
+          setParticipants((prev) => {
+            if (!(message.userId in prev)) return prev;
+            const next = { ...prev };
+            delete next[message.userId];
+            return next;
+          });
+          return;
+        }
+
+        if (message.type === 'awareness-update') {
+          setParticipants((prev) => ({
+            ...prev,
+            [message.userId]: {
+              ...prev[message.userId],
+              id: message.userId,
+              color: message.awareness.color ?? prev[message.userId]?.color,
+              cursor: message.awareness.cursor,
+              selection: message.awareness.selection,
+            },
+          }));
+          return;
+        }
+
         if (message.type === 'error') {
           setError(message);
           if (message.code === 'PERMISSION_DENIED' || message.code === 'UNAUTHORIZED') {
@@ -129,6 +193,7 @@ export function useYjsConnection(documentId) {
           message: 'Unable to reconnect after several attempts.',
         });
         updateStatus('disconnected');
+        setParticipants({}); // no live connection left to have any presence over
         return;
       }
       const delay = Math.min(
@@ -146,10 +211,54 @@ export function useYjsConnection(documentId) {
     return () => {
       intentionalCloseRef.current = true;
       clearTimeout(reconnectTimeoutRef.current);
+      clearTimeout(awarenessTimeoutRef.current);
       wsRef.current?.close();
       yDoc.destroy();
     };
   }, [documentId, yDoc]);
+
+  // Sends a throttled cursor/selection ping to the server (PRD.md Section
+  // 10.5's `awareness-update`). `awareness` is `{ cursor, selection }` --
+  // `cursor` a character offset, `selection` either null (collapsed caret)
+  // or a [start, end] pair. See AWARENESS_THROTTLE_MS above for why this
+  // isn't a plain unthrottled ws.send.
+  const sendAwareness = useCallback(
+    (awareness) => {
+      const doSend = () => {
+        const ws = wsRef.current;
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        awarenessLastSentAtRef.current = Date.now();
+        ws.send(JSON.stringify({ type: 'awareness-update', documentId, awareness }));
+      };
+
+      const elapsed = Date.now() - awarenessLastSentAtRef.current;
+      if (elapsed >= AWARENESS_THROTTLE_MS) {
+        awarenessPendingRef.current = null;
+        doSend();
+        return;
+      }
+
+      // Within the throttle window: remember the LATEST position and make
+      // sure exactly one trailing send is scheduled for when the window
+      // ends, so a burst of calls (e.g. every keystroke) collapses into one
+      // message instead of one per call.
+      awarenessPendingRef.current = awareness;
+      if (!awarenessTimeoutRef.current) {
+        awarenessTimeoutRef.current = setTimeout(() => {
+          awarenessTimeoutRef.current = null;
+          const pending = awarenessPendingRef.current;
+          awarenessPendingRef.current = null;
+          if (pending) {
+            const ws = wsRef.current;
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+            awarenessLastSentAtRef.current = Date.now();
+            ws.send(JSON.stringify({ type: 'awareness-update', documentId, awareness: pending }));
+          }
+        }, AWARENESS_THROTTLE_MS - elapsed);
+      }
+    },
+    [documentId]
+  );
 
   // Relays LOCAL edits to the server. See the SERVER_ORIGIN comment above --
   // this is the other half of the echo-loop check: updates applied with
@@ -184,7 +293,7 @@ export function useYjsConnection(documentId) {
     return () => yDoc.off('update', handleUpdate);
   }, [yDoc, documentId]);
 
-  return { yDoc, connectionStatus, canEdit, error };
+  return { yDoc, connectionStatus, canEdit, error, participants, sendAwareness };
 }
 
 function base64ToBytes(base64) {

@@ -1,10 +1,12 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { useAuth } from '../hooks/useAuth.js';
 import { useYjsConnection } from '../hooks/useYjsConnection.js';
 import * as documentsApi from '../api/documentsApi.js';
 import PermissionsPanel from '../components/PermissionsPanel.jsx';
 import EditorSurface from '../components/EditorSurface.jsx';
+import PresenceBar from '../components/PresenceBar.jsx';
+import RemoteCursors from '../components/RemoteCursors.jsx';
 
 const CONNECTION_LABELS = {
   connecting: 'Connecting…',
@@ -45,7 +47,13 @@ export default function DocumentEditorPage() {
     connectionStatus,
     canEdit,
     error: syncError,
+    participants,
+    sendAwareness,
   } = useYjsConnection(id);
+
+  // Shared with RemoteCursors so it measures against the exact DOM node
+  // EditorSurface renders text into.
+  const editorContainerRef = useRef(null);
 
   if (status === 'loading') {
     return <p className="page-status">Loading document…</p>;
@@ -60,6 +68,16 @@ export default function DocumentEditorPage() {
       </div>
     );
   }
+
+  // Excludes the CURRENT user's own id from the presence/cursor data, so
+  // opening the same document as yourself in a second tab (or React
+  // StrictMode's dev-only double-mount momentarily opening a second socket)
+  // never renders "yourself" back as if you were a separate remote
+  // collaborator -- the server broadcasts user-joined/awareness-update to
+  // every OTHER connection in the room, which includes a second connection
+  // for the same person if one exists, so this has to be filtered here.
+  const otherParticipants = { ...participants };
+  if (user) delete otherParticipants[user.id];
 
   const isOwner = docData.ownerId === user?.id;
   // Editing stays enabled through 'connecting'/'reconnecting' -- local
@@ -86,6 +104,8 @@ export default function DocumentEditorPage() {
       </div>
       <p className="document-meta">Last updated {new Date(docData.updatedAt).toLocaleString()}</p>
 
+      <PresenceBar participants={otherParticipants} currentUser={user} />
+
       {connectionStatus === 'disconnected' && syncError && (
         <p className="error-message" role="alert">
           {syncError.message}
@@ -95,7 +115,15 @@ export default function DocumentEditorPage() {
         <p className="page-status">You have view-only access to this document.</p>
       )}
 
-      <EditorSurface yDoc={yDoc} disabled={editingDisabled} />
+      <div className="editor-surface-wrapper">
+        <EditorSurface
+          ref={editorContainerRef}
+          yDoc={yDoc}
+          disabled={editingDisabled}
+          onAwarenessChange={sendAwareness}
+        />
+        <RemoteCursors containerRef={editorContainerRef} yDoc={yDoc} participants={otherParticipants} />
+      </div>
 
       <PermissionsPanel documentId={id} isOwner={isOwner} />
     </div>

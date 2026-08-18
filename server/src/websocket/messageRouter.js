@@ -2,11 +2,13 @@ import { logger } from '../utils/logger.js';
 import { handleJoinDocument } from './handlers/joinDocument.js';
 import { handleSyncUpdate } from './handlers/syncUpdate.js';
 import { handleLeaveDocument } from './handlers/leaveDocument.js';
+import { handleAwarenessUpdate } from './handlers/awarenessUpdate.js';
 
 const handlers = {
   'join-document': handleJoinDocument,
   'sync-update': handleSyncUpdate,
   'leave-document': handleLeaveDocument,
+  'awareness-update': handleAwarenessUpdate,
 };
 
 function sendError(client, code, message) {

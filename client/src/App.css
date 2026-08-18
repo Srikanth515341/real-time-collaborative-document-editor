@@ -210,6 +210,37 @@ a {
   color: var(--color-error-text);
 }
 
+/* Presence bar */
+.presence-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  min-height: 2rem;
+}
+
+.presence-avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2rem;
+  height: 2rem;
+  border-radius: 50%;
+  color: white;
+  font-size: 0.75rem;
+  font-weight: 700;
+  border: 2px solid var(--color-surface);
+  box-shadow: 0 0 0 1px var(--color-border);
+}
+
+.presence-empty {
+  color: var(--color-muted);
+  font-size: 0.85rem;
+}
+
+.editor-surface-wrapper {
+  position: relative;
+}
+
 .editor-surface {
   min-height: 300px;
   border: 1px solid var(--color-border);
@@ -220,6 +251,51 @@ a {
   word-wrap: break-word;
   font-size: 1rem;
   line-height: 1.6;
+}
+
+/* Remote cursors overlay -- sits on top of .editor-surface inside the same
+   relatively-positioned wrapper; pointer-events disabled so it never
+   intercepts clicks/typing meant for the editor underneath. */
+.remote-cursors-layer {
+  /* No padding here on purpose -- getOffsetRect/getRangeRects in
+     RemoteCursors.jsx already measure positions relative to
+     .editor-surface's own border box (which includes its 1rem padding), so
+     this layer's origin must line up with that same border box exactly, not
+     be inset further. */
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  overflow: hidden;
+}
+
+.remote-selection {
+  position: absolute;
+  opacity: 0.25;
+  border-radius: 2px;
+}
+
+.remote-caret {
+  position: absolute;
+  width: 2px;
+  animation: remote-caret-blink 1s step-end infinite;
+}
+
+.remote-caret-label {
+  position: absolute;
+  top: -1.15rem;
+  left: -1px;
+  white-space: nowrap;
+  font-size: 0.65rem;
+  font-weight: 600;
+  color: white;
+  padding: 0.05rem 0.3rem;
+  border-radius: 3px;
+}
+
+@keyframes remote-caret-blink {
+  50% {
+    opacity: 0.3;
+  }
 }
 
 .editor-surface:focus {
